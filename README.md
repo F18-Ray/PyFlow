@@ -11,6 +11,7 @@ PyFlow is a high-level network protocol with APIs for transferring messages, fil
 - **Encrypted TCP channel** — RSA-OAEP message encryption with a TOFU (trust-on-first-use) peer-key registry, session nonces and sequence numbers against replay, and a circuit breaker against re-exchange storms. See [docs/Crypto](docs/Crypto/Crypto.rst) and the encrypted-channel sections of the TCP API docs.
 - **C/OpenSSL cryptography library** — `libcrypto_api` provides RSA-OAEP, ECDH (P-256/384/521), HKDF-SHA256 and AES-256-GCM with a stable C API (`pf_*` prefix) usable from C, CMake or pkg-config.
 - **Multi-instance launcher** — `python -m PyFlow` (package entry point backed by `PyFlow/flow_setup.py`) starts one or more server/client instances from a CLI, an interactive prompt, or a `setup.json` configuration file.
+- **Extension protocols** — `command_control_extension_tcp.py` (remote command execution with log collection) and `forward_extension_tcp.py` (forwarding messages/files/folders to multiple destinations) plug into any instance via `setup_*_commands()`; `flow_setup.py` loads them automatically for every instance whose `setup.json` config sets `is_extend_command=True`, and starts instances in a background thread when `is_input_command_in_console=False`.
 - **Web tool** — `PyFlow/transfer_web/` wraps the TCP protocol in a browser UI for non-library use: `setup_server.py` opens a startup-configuration page (saved to `.Flow_Web/setup_server.json`, same shape as `setup.json`) and then serves a status page plus a client-facing API; `setup_client.py` connects to a server by address, and both pages offer a sidebar of connected instances, message/file/folder sending (with forwarding to other clients), and extension loading. Backed by Flask.
 
 ## Architecture
@@ -24,6 +25,8 @@ PyFlow/
 │   ├── connect_udp.py       UDP communication
 │   ├── rsa_crypto.py        ctypes binding to libcrypto_api + TOFU key registry
 │   └── decode_command_table.json   wire-format table for the file-transfer protocol
+├── command_control_extension_tcp.py  command-control extension over TCP
+├── forward_extension_tcp.py          forward extension over TCP (messages/files/folders to multiple destinations)
 ├── transfer_web/                     web tool: setup_server.py / setup_client.py launchers,
 │   │                                 web_backend/ (Flask + TCP server wrapper),
 │   │                                 web_front/ (Flask + TCP client wrapper), static/ (shared UI)
