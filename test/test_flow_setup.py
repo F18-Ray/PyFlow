@@ -195,8 +195,46 @@ def test_launch_instance_os_branches(  # noqa: PLR0913
     assert mocked_popen.call_args.kwargs.get("cwd") == project_root
 
 
-def test_launch_instance_popen_failure(monkeypatch, capsys):
-    """Exception in Popen is caught, error printed, temp file cleaned up."""
+@pytest.mark.parametrize(
+    "system,which_return,kind,expected_module",
+    [
+        ("Windows", None, "server", "PyFlow.transfer_web.setup_server"),
+        ("Linux", "xterm", "client", "PyFlow.transfer_web.setup_client"),
+        ("Darwin", None, "server", "PyFlow.transfer_web.setup_server"),
+        ("Linux", None, "client", "PyFlow.transfer_web.setup_client"),
+        ("FreeBSD", None, "server", "PyFlow.transfer_web.setup_server"),
+    ],
+)
+def test_launch_web_tool_os_branches(  # noqa: PLR0913
+    monkeypatch, mocked_popen, system, which_return, kind, expected_module
+):
+    monkeypatch.setattr(fs.platform, "system", lambda: system)
+    if which_return is not None:
+        monkeypatch.setattr(fs.shutil, "which", lambda t: which_return)
+    elif system == "Linux":
+        monkeypatch.setattr(fs.shutil, "which", lambda t: None)
+
+    fs.launch_web_tool(kind)
+    mocked_popen.assert_called_once()
+    cmd = mocked_popen.call_args.args[0]
+    if system in ("Windows", "Darwin") or (system == "Linux" and which_return):
+        assert isinstance(cmd, str)
+    else:
+        assert isinstance(cmd, list)
+    cmd_repr = cmd if isinstance(cmd, str) else " ".join(cmd)
+    assert expected_module in cmd_repr
+    # the child must be started as a package (python -m), not as the
+    # script file, so the relative imports in the launcher resolve
+    assert "-m PyFlow.transfer_web.setup_" in cmd_repr
+    assert "setup_server.py" not in cmd_repr
+    assert "setup_client.py" not in cmd_repr
+    # and from the project root, so `PyFlow` is importable
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(fs.__file__)))
+    assert mocked_popen.call_args.kwargs.get("cwd") == project_root
+
+
+def test_launch_web_tool_popen_failure(monkeypatch, capsys):
+    """Exception in Popen is caught and an error is printed."""
 
     def failing_popen(*args, **kwargs):
         raise OSError("mock failure")
@@ -204,10 +242,10 @@ def test_launch_instance_popen_failure(monkeypatch, capsys):
     monkeypatch.setattr(fs.subprocess, "Popen", failing_popen)
     monkeypatch.setattr(fs.platform, "system", lambda: "Windows")
 
-    fs.launch_instance({"host": "127.0.0.1", "port": 65000}, "server")
+    fs.launch_web_tool("server")
 
     captured = capsys.readouterr()
-    assert "Failed to launch instance" in captured.out
+    assert "Failed to launch web server" in captured.out
     assert "mock failure" in captured.out
 
 
@@ -488,10 +526,31 @@ def test_main_type_client_missing_args_rejected(monkeypatch, cli_cleanup):
         fs.main()
 
 
-def test_main_type_server_missing_addr_rejected(monkeypatch, cli_cleanup):
-    monkeypatch.setattr(sys, "argv", ["flow_setup", "--type", "0"])
-    with pytest.raises(SystemExit):
-        fs.main()
+def test_main_web_server_flag(monkeypatch, cli_cleanup):
+    """--web_server launches the web TCP server tool and returns."""
+    monkeypatch.setattr(fs, "launch_web_tool", MagicMock())
+    monkeypatch.setattr(sys, "argv", ["flow_setup", "--web_server"])
+    fs.main()
+    fs.launch_web_tool.assert_called_once_with("server")
+
+
+def test_main_web_client_flag(monkeypatch, cli_cleanup):
+    """--web_client launches the web TCP client tool and returns."""
+    monkeypatch.setattr(fs, "launch_web_tool", MagicMock())
+    monkeypatch.setattr(sys, "argv", ["flow_setup", "--web_client"])
+    fs.main()
+    fs.launch_web_tool.assert_called_once_with("client")
+
+
+def test_main_web_both_flags_launch_both(monkeypatch, cli_cleanup):
+    """Both web flags together launch both tools."""
+    monkeypatch.setattr(fs, "launch_web_tool", MagicMock())
+    monkeypatch.setattr(sys, "argv", ["flow_setup", "--web_server", "--web_client"])
+    fs.main()
+    assert fs.launch_web_tool.call_args_list == [
+        (("server",),),
+        (("client",),),
+    ]
 
 
 def test_main_existing_setup_json_keep_existing(monkeypatch, cli_cleanup, tmp_config):

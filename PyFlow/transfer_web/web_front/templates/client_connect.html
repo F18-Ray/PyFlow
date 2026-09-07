@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyFlow TCP Client</title>
+  <link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+  <div class="center-wrap">
+    <div class="card">
+      <h1>Connect to a PyFlow TCP Server</h1>
+      <p class="subtitle">Enter the server address: an <code>http://</code> or <code>https://</code> domain, or a bare IP address (optionally with the web port, e.g. <code>192.168.1.10:5000</code>).</p>
+      <form id="connect-form">
+        <div class="field">
+          <label for="address">Server address</label>
+          <input type="text" id="address" placeholder="http://example.com  |  192.168.1.10" value="{{ last_address }}" autocomplete="off">
+        </div>
+        <div class="actions">
+          <button type="submit" class="btn" id="connect-btn">Connect</button>
+          <span class="status-line" id="status"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById("connect-form");
+    const status = document.getElementById("status");
+    const btn = document.getElementById("connect-btn");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const address = document.getElementById("address").value.trim();
+      if (!address) {
+        status.className = "status-line err";
+        status.textContent = "Please enter a server address.";
+        return;
+      }
+      btn.disabled = true;
+      status.className = "status-line";
+      status.textContent = "Contacting the server...";
+      try {
+        const resp = await fetch("/api/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ address }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          status.className = "status-line err";
+          status.textContent = "Failed: " + (data.error || resp.status);
+          btn.disabled = false;
+          return;
+        }
+        status.className = "status-line ok";
+        status.textContent = "Connected to " + data.server_info.host + ":" + data.server_info.port;
+        setTimeout(() => { location.reload(); }, 800);
+      } catch (err) {
+        status.className = "status-line err";
+        status.textContent = "Failed: " + err.message;
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

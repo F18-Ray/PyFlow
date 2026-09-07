@@ -7,7 +7,7 @@ name = "pyflow-net"
 version = "0.5.0"
 description = "PyFlow is a high-level network protocol with APIs for transferring messages, files, and folders, plus extensible interfaces etc.."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["flask>=3.0"]
 authors = [
   { name="F18-Maverick", email="rayxu2333@outlook.com" },
 ]

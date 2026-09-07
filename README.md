@@ -11,7 +11,7 @@ PyFlow is a high-level network protocol with APIs for transferring messages, fil
 - **Encrypted TCP channel** — RSA-OAEP message encryption with a TOFU (trust-on-first-use) peer-key registry, session nonces and sequence numbers against replay, and a circuit breaker against re-exchange storms. See [docs/Crypto](docs/Crypto/Crypto.rst) and the encrypted-channel sections of the TCP API docs.
 - **C/OpenSSL cryptography library** — `libcrypto_api` provides RSA-OAEP, ECDH (P-256/384/521), HKDF-SHA256 and AES-256-GCM with a stable C API (`pf_*` prefix) usable from C, CMake or pkg-config.
 - **Multi-instance launcher** — `python -m PyFlow` (package entry point backed by `PyFlow/flow_setup.py`) starts one or more server/client instances from a CLI, an interactive prompt, or a `setup.json` configuration file.
-- **Extension protocols** — `command_control_extension_tcp.py` (remote command execution with log collection) and `forward_extension_tcp.py` (forwarding messages/files/folders to multiple destinations) plug into any instance via `setup_*_commands()`; `flow_setup.py` loads them automatically for every instance whose `setup.json` config sets `is_extend_command=True`, and starts instances in a background thread when `is_input_command_in_console=False`.
+- **Web tool** — `PyFlow/transfer_web/` wraps the TCP protocol in a browser UI for non-library use: `setup_server.py` opens a startup-configuration page (saved to `.Flow_Web/setup_server.json`, same shape as `setup.json`) and then serves a status page plus a client-facing API; `setup_client.py` connects to a server by address, and both pages offer a sidebar of connected instances, message/file/folder sending (with forwarding to other clients), and extension loading. Backed by Flask.
 
 ## Architecture
 
@@ -24,8 +24,9 @@ PyFlow/
 │   ├── connect_udp.py       UDP communication
 │   ├── rsa_crypto.py        ctypes binding to libcrypto_api + TOFU key registry
 │   └── decode_command_table.json   wire-format table for the file-transfer protocol
-├── command_control_extension_tcp.py  command-control extension over TCP
-├── forward_extension_tcp.py          forward extension over TCP (messages/files/folders to multiple destinations)
+├── transfer_web/                     web tool: setup_server.py / setup_client.py launchers,
+│   │                                 web_backend/ (Flask + TCP server wrapper),
+│   │                                 web_front/ (Flask + TCP client wrapper), static/ (shared UI)
 ├── __init__.py / __main__.py         package launcher entry (`python -m PyFlow`)
 ├── flow_setup.py                     launcher implementation
 └── setup.json                        default launcher configuration (generated)
@@ -34,7 +35,7 @@ docs/                        Sphinx documentation (multi-language)
 CMakeLists.txt               top-level build for the C library and C tests
 ```
 
-The Python layer runs on the standard library only; the C library is loaded at runtime via `ctypes`.
+The Python layer runs on the standard library plus Flask (used only by the `transfer_web` web tool); the C library is loaded at runtime via `ctypes`.
 
 ## Requirements
 
@@ -100,6 +101,35 @@ Start a client that connects to that server (and binds its own local address/por
 ```bash
 uv run python -m PyFlow --type 1 --setup_addr_port 127.0.0.1:23456 --connect_addr_port 127.0.0.1:12345
 ```
+
+### Web tool (browser UI)
+
+The web tool wraps the TCP protocol in a browser UI for non-library use
+(requires Flask, installed by `uv sync`). Launch it through the package
+launcher or directly:
+
+```bash
+uv run python -m PyFlow --web_server   # server: config UI -> status page + API
+uv run python -m PyFlow --web_client   # client: connect UI -> main UI
+```
+
+or directly:
+
+```bash
+uv run python PyFlow/transfer_web/setup_server.py
+uv run python PyFlow/transfer_web/setup_client.py
+```
+
+On first run the server launcher opens a startup-configuration page
+showing every `TCP_Server_Base` parameter with its default; the saved
+config lives in `PyFlow/transfer_web/.Flow_Web/setup_server.json` (same
+shape as `setup.json`). Once the TCP server is up, the server's web
+backend serves a status page and a client-facing API
+(`/api/server_info` returns the TCP address/port). The client launcher
+asks for the server address (an `http`/`https` domain or a bare IP) and
+connects through the server's web backend. Both pages show a sidebar of
+connected instances, message/file/folder sending (client-to-client
+sends are forwarded through the server), and extension loading.
 
 ### `setup.json`
 

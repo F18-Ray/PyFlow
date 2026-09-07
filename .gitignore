@@ -25,6 +25,8 @@ docs/.sync
 *~
 PyFlow/setup.json
 PyFlow/network_api/received_files
+PyFlow/added_extensions.json
+PyFlow/transfer_web/.Flow_Web/
 pyflow_net.egg-info
 dist
 .coverage

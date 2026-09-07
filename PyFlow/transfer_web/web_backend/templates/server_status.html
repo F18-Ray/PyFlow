@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyFlow TCP Server</title>
+  <link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>PyFlow TCP Server</h1>
+        <div class="meta" id="server-meta">connecting...</div>
+        <div class="sidebar-actions">
+          <button class="btn btn-ghost" id="reload-btn" title="Reload instance list">&#8635; Reload</button>
+          <button class="btn btn-ghost" id="add-ext-btn" title="Add an extension protocol file">+ Extension</button>
+        </div>
+      </div>
+      <div class="instance-list" id="instance-list"></div>
+      <div class="sidebar-footer" id="sidebar-footer"></div>
+    </aside>
+    <main class="main">
+      <div class="main-topbar">
+        <span class="title" id="target-title">Select a client</span>
+        <span class="spacer"></span>
+        <span class="conn" id="conn-indicator">starting...</span>
+      </div>
+      <div class="chat-area" id="chat-area">
+        <div class="empty-hint" id="empty-hint">The PyFlow TCP Server is running! Connect it by the host address of the server.<br><br>Select a connected client on the left to send messages, files or folders.</div>
+      </div>
+      <div class="input-box">
+        <div class="row">
+          <textarea id="input" placeholder="Type a message..." rows="1"></textarea>
+          <button class="btn" id="send-btn">Send</button>
+        </div>
+        <div class="icon-bar" id="icon-bar">
+          <button class="icon-btn" id="file-btn" title="Send file(s)">&#128193;</button>
+          <button class="icon-btn" id="folder-btn" title="Send folder">&#128194;</button>
+          <button class="icon-btn" id="plus-btn" title="Add an extension protocol">+</button>
+          <span class="hint" id="icon-hint"></span>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script>window.WEB_MODE = "{{ mode }}";</script>
+  <script src="/static/common.js"></script>
+</body>
+</html>

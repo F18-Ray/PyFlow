@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyFlow TCP Server Setup</title>
+  <link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+  <div class="center-wrap">
+    <div class="card">
+      <h1>PyFlow TCP Server Setup</h1>
+      <p class="subtitle">Configure the TCP server. Every parameter has a default value; change only what you need.</p>
+      <form id="config-form" class="form-grid">
+        {% for key, label, ftype, default, help in fields %}
+        <div class="field">
+          <label for="f-{{ key }}">{{ label }}</label>
+          {% if ftype == "bool" %}
+          <div class="checkbox-row">
+            <input type="checkbox" id="f-{{ key }}" data-key="{{ key }}" data-type="bool"
+                   {% if default %}checked{% endif %}>
+            <span class="help">{{ help }}</span>
+          </div>
+          {% else %}
+          <input type="{{ ftype }}" id="f-{{ key }}" data-key="{{ key }}" data-type="{{ ftype }}"
+                 value="{{ default }}" {% if ftype == "number" %}step="any"{% endif %}>
+          <div class="help">{{ help }}</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+        {% for key, label, ftype, default, help in web_fields %}
+        <div class="field">
+          <label for="f-{{ key }}">{{ label }}</label>
+          <input type="{{ ftype }}" id="f-{{ key }}" data-key="{{ key }}" data-type="{{ ftype }}"
+                 value="{{ default }}" {% if ftype == "number" %}step="any"{% endif %}>
+          <div class="help">{{ help }}</div>
+        </div>
+        {% endfor %}
+        <div class="actions full">
+          <button type="submit" class="btn" id="save-btn">Save &amp; Start Server</button>
+          <span class="status-line" id="status"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById("config-form");
+    const status = document.getElementById("status");
+    const saveBtn = document.getElementById("save-btn");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      saveBtn.disabled = true;
+      status.className = "status-line";
+      status.textContent = "Saving configuration and starting the TCP server...";
+      const params = {};
+      let webPort = 5000;
+      form.querySelectorAll("[data-key]").forEach((el) => {
+        const key = el.dataset.key;
+        const type = el.dataset.type;
+        let value;
+        if (type === "bool") {
+          value = el.checked;
+        } else if (type === "number") {
+          value = el.value === "" ? null : Number(el.value);
+        } else {
+          value = el.value;
+        }
+        if (key === "web_port") {
+          webPort = Number(el.value) || 5000;
+        } else {
+          params[key] = value;
+        }
+      });
+      try {
+        const resp = await fetch("/api/save_config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ params, web_port: webPort }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          status.className = "status-line err";
+          status.textContent = "Failed: " + (data.error || resp.status);
+          saveBtn.disabled = false;
+          return;
+        }
+        status.className = "status-line ok";
+        status.textContent = "TCP server started at " + data.server_info.host + ":" + data.server_info.port;
+        setTimeout(() => { location.reload(); }, 1200);
+      } catch (err) {
+        status.className = "status-line err";
+        status.textContent = "Failed: " + err.message;
+        saveBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

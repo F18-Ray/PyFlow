@@ -179,6 +179,59 @@ def launch_instance(config, instance_type):
             pass
 
 
+# ---- web tool launchers (transfer_web) --------------------------------------
+
+def launch_web_tool(kind):
+    """Launch the transfer_web launcher (``kind`` = "server" or "client").
+
+    The web tool is a Flask app that opens a browser UI, so it runs in
+    its own process (a terminal window when one is available, otherwise
+    detached) and the launcher returns immediately.
+    """
+    module = (
+        "PyFlow.transfer_web.setup_server" if kind == "server" else "PyFlow.transfer_web.setup_client"
+    )
+    python = sys.executable
+    system = platform.system()
+    try:
+        if system == "Windows":
+            cmd = f"start cmd /k {python} -m {module}"
+            subprocess.Popen(cmd, shell=True, cwd=project_root)
+        elif system == "Linux":
+            terminals = ["gnome-terminal", "xterm", "x-terminal-emulator"]
+            launched = False
+            for term in terminals:
+                if shutil.which(term):
+                    cmd = f"{term} -- {python} -m {module}"
+                    subprocess.Popen(cmd, shell=True, cwd=project_root)
+                    launched = True
+                    break
+            if not launched:
+                subprocess.Popen(
+                    [python, "-m", module],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    cwd=project_root,
+                )
+        elif system == "Darwin":
+            cmd = f"open -a Terminal.app {python} -m {module}"
+            subprocess.Popen(cmd, shell=True, cwd=project_root)
+        else:
+            subprocess.Popen(
+                [python, "-m", module],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=project_root,
+            )
+    except Exception as e:
+        print(f"Failed to launch web {kind}: {e}")
+        traceback.print_exc()
+
+
 # ---- instance editor: reduce/change existing instances ----------------------
 
 _MOUSE_WHEEL_UP = 64
@@ -1061,6 +1114,12 @@ def main():  # noqa: PLR0911, PLR0912, PLR0915
         return
     parser = argparse.ArgumentParser(description="Flow Setup Launcher")
     parser.add_argument("--type", type=int, choices=[0, 1], help="0=Server, 1=Client")
+    parser.add_argument(
+        "--web_server", action="store_true", help="Launch the web TCP server tool (browser UI)"
+    )
+    parser.add_argument(
+        "--web_client", action="store_true", help="Launch the web TCP client tool (browser UI)"
+    )
     parser.add_argument("--setup_addr_port", type=str, help="Bind address and port (host:port)")
     parser.add_argument(
         "--connect_addr_port", type=str, help="Server address and port to connect (client required)"
@@ -1071,6 +1130,12 @@ def main():  # noqa: PLR0911, PLR0912, PLR0915
         "--setup_num", type=int, default=1, help="Number of instances to launch (only 1 is allowed)"
     )
     args = parser.parse_args()
+    if args.web_server or args.web_client:
+        if args.web_server:
+            launch_web_tool("server")
+        if args.web_client:
+            launch_web_tool("client")
+        return
     if args.add is not None:
         try:
             add_extension.add_extension(args.add)
