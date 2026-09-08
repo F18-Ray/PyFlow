@@ -11,6 +11,7 @@ import threading
 import uuid
 import errno
 import queue
+import json
 from . import rsa_crypto
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -69,7 +70,6 @@ def _parse_destination_path(command_part):
         ):
             return command_part[-2]
     return None
-
 
 
 class TCP_Server_Base:  # TCP server class
@@ -152,6 +152,20 @@ class TCP_Server_Base:  # TCP server class
         self._message_listeners = []
         self._file_listeners = []
         self._event_listeners_lock = threading.Lock()
+        # Inbound message/event stores: external code reads these instead of
+        # registering listeners. Keyed by the sender's socket; each value is
+        # a list of [content, timestamp] pairs. When a store's total size
+        # reaches max_dict_size (64 KiB) it is flushed to its JSON log and
+        # cleared (see _record_message/_record_event/_flush_*_dict).
+        self.messages_dict = {}
+        self.events_dict = {}
+        self._messages_dict_lock = threading.Lock()
+        self._events_dict_lock = threading.Lock()
+        self._messages_dict_size = 0
+        self._events_dict_size = 0
+        self.max_dict_size = 64 * 1024
+        self.messages_log_file = os.path.join(self.project_info_dir, "messages_log.json")
+        self.events_log_file = os.path.join(self.project_info_dir, "events_log.json")
         self.is_extend_command = is_extend_command
         self.is_enable_encrypto = is_enable_encrypto
         self.is_custom_keys = is_custom_keys
@@ -425,6 +439,123 @@ class TCP_Server_Base:  # TCP server class
                 listener(client_id, full_path, name, size, command)
             except Exception:
                 traceback.print_exc()
+
+    def _socket_key(self, sock):
+        """Serializable key for a sender socket (its peer address)."""
+        try:
+            ip, port = sock.getpeername()[:2]
+            return f"{ip}:{port}"
+        except Exception:
+            return str(sock)
+
+    def _record_message(self, sock, content):
+        """Store one inbound plain-text message under the sender's socket.
+
+        External code reads ``messages_dict`` (or the JSON log) instead of
+        registering a message listener. The entry is ``[content, timestamp]``
+        with the timestamp of arrival.
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._messages_dict_lock:
+            self.messages_dict.setdefault(sock, []).append([content, timestamp])
+            self._messages_dict_size += len(content.encode("utf-8", "replace")) + len(timestamp)
+            if self._messages_dict_size >= self.max_dict_size:
+                self._flush_dict_locked(
+                    self.messages_dict, "_messages_dict_size", self.messages_log_file
+                )
+
+    def _record_event(self, sock, command):
+        """Store one inbound command as an event under the sender's socket.
+
+        The event content is the original wire command from the peer (file
+        transfers, folder transfers, extension commands, ...). External code
+        reads ``events_dict`` (or the JSON log) instead of registering a
+        listener. File-transfer events get their completion timestamp via
+        ``_update_event_timestamp``.
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._events_dict_lock:
+            self.events_dict.setdefault(sock, []).append([command, timestamp])
+            self._events_dict_size += len(command.encode("utf-8", "replace")) + len(timestamp)
+            if self._events_dict_size >= self.max_dict_size:
+                self._flush_dict_locked(
+                    self.events_dict, "_events_dict_size", self.events_log_file
+                )
+
+    def _update_event_timestamp(self, sock, command, timestamp):
+        """Stamp the completion time onto the recorded event for ``command``.
+
+        File transfers finish on a worker thread after the receive thread
+        recorded the command, so the event's timestamp is refreshed here with
+        the moment the transfer actually completed.
+        """
+        with self._events_dict_lock:
+            entries = self.events_dict.get(sock)
+            if entries:
+                for entry in reversed(entries):
+                    if entry[0] == command:
+                        entry[1] = timestamp
+                        return
+
+    def _splice_event_command(self, command, **parts):
+        """Return the command to record as an event.
+
+        The wire command is recorded verbatim whenever it is available. When
+        this end cannot see the original command (a transfer relayed by the
+        server, or a protocol-internal control line), splice a readable
+        command from the available parts so the event still identifies the
+        transfer.
+        """
+        if command:
+            return command
+        kind = parts.get("kind")
+        fname = parts.get("fname")
+        rel_dir = parts.get("rel_dir")
+        if kind == "folder" and fname:
+            if rel_dir:
+                return "/file_folder {} {}".format(shlex.quote(rel_dir), shlex.quote(fname))
+            return "/file_folder {}".format(shlex.quote(fname))
+        if fname:
+            return "/file {}".format(shlex.quote(fname))
+        return parts.get("fallback") or "/unknown"
+
+    def _flush_dict_locked(self, d, size_attr, path):
+        """Flush ``d`` (socket -> [[content, ts], ...]) into its JSON log and
+        clear it. The caller must hold the dict's lock."""
+        if not d:
+            return
+        snapshot = dict(d)
+        d.clear()
+        setattr(self, size_attr, 0)
+        self._merge_json_log(path, snapshot)
+
+    def _flush_messages_dict(self):
+        with self._messages_dict_lock:
+            self._flush_dict_locked(
+                self.messages_dict, "_messages_dict_size", self.messages_log_file
+            )
+
+    def _flush_events_dict(self):
+        with self._events_dict_lock:
+            self._flush_dict_locked(
+                self.events_dict, "_events_dict_size", self.events_log_file
+            )
+
+    def _merge_json_log(self, path, snapshot):
+        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket)."""
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = {}
+            for sock, entries in snapshot.items():
+                key = self._socket_key(sock)
+                existing.setdefault(key, []).extend(entries)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+        except Exception:
+            traceback.print_exc()
 
     def submit_task(self, func, *args, **kwargs):
         self._task_semaphore.acquire()
@@ -973,9 +1104,11 @@ class TCP_Server_Base:  # TCP server class
                         message = plain.strip()
                     print(message)
                     if message.startswith("/"):  # deal with special command
+                        self._record_event(client_socket, message)
                         response = self.handle_command(client_socket, client_address, message)
                     else:
                         self._notify_message_received(client_id, message)
+                        self._record_message(client_socket, message)
                         timestamp = datetime.now().strftime("%H:%M:%S")  # deal with normal message
                         log_msg = f"[{timestamp}] {client_id}: {message}"
                         print(log_msg)
@@ -1394,6 +1527,11 @@ class TCP_Server_Base:  # TCP server class
                 # ack send must not skip the key registration (the server
                 # would never announce readiness and the handshake hangs)
                 self._notify_file_received(client_id, full_path, final_filename, file_size, command)
+                self._update_event_timestamp(
+                    client_socket,
+                    self._splice_event_command(command, fname=final_filename),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
                 print(f"file {filename} received from {client_id}, size {file_size} bytes")
                 if command_part[0] == "/crypto_pub_key":
                     with self._crypto_lock:
@@ -2381,6 +2519,8 @@ class TCP_Server_Base:  # TCP server class
     def stop(self):  # shutting down the server
         self.running = False
         self.free_port()
+        self._flush_messages_dict()
+        self._flush_events_dict()
         with self.client_lock:  # close all clients connections
             for client_info in self.clients.values():
                 try:
@@ -2486,6 +2626,20 @@ class TCP_Client_Base:  # TCP client class
         self._message_listeners = []
         self._file_listeners = []
         self._event_listeners_lock = threading.Lock()
+        # Inbound message/event stores: external code reads these instead of
+        # registering listeners. Keyed by the sender's socket; each value is
+        # a list of [content, timestamp] pairs. When a store's total size
+        # reaches max_dict_size (64 KiB) it is flushed to its JSON log and
+        # cleared (see _record_message/_record_event/_flush_*_dict).
+        self.messages_dict = {}
+        self.events_dict = {}
+        self._messages_dict_lock = threading.Lock()
+        self._events_dict_lock = threading.Lock()
+        self._messages_dict_size = 0
+        self._events_dict_size = 0
+        self.max_dict_size = 64 * 1024
+        self.messages_log_file = os.path.join(self.project_info_dir, "messages_log.json")
+        self.events_log_file = os.path.join(self.project_info_dir, "events_log.json")
         self.is_extend_command = is_extend_command
         self.is_enable_encrypto = is_enable_encrypto
         self.is_custom_keys = is_custom_keys
@@ -2594,6 +2748,123 @@ class TCP_Client_Base:  # TCP client class
                 listener(full_path, name, size, command)
             except Exception:
                 traceback.print_exc()
+
+    def _socket_key(self, sock):
+        """Serializable key for a sender socket (its peer address)."""
+        try:
+            ip, port = sock.getpeername()[:2]
+            return f"{ip}:{port}"
+        except Exception:
+            return str(sock)
+
+    def _record_message(self, sock, content):
+        """Store one inbound plain-text message under the sender's socket.
+
+        External code reads ``messages_dict`` (or the JSON log) instead of
+        registering a message listener. The entry is ``[content, timestamp]``
+        with the timestamp of arrival.
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._messages_dict_lock:
+            self.messages_dict.setdefault(sock, []).append([content, timestamp])
+            self._messages_dict_size += len(content.encode("utf-8", "replace")) + len(timestamp)
+            if self._messages_dict_size >= self.max_dict_size:
+                self._flush_dict_locked(
+                    self.messages_dict, "_messages_dict_size", self.messages_log_file
+                )
+
+    def _record_event(self, sock, command):
+        """Store one inbound command as an event under the sender's socket.
+
+        The event content is the original wire command from the peer (file
+        transfers, folder transfers, extension commands, ...). External code
+        reads ``events_dict`` (or the JSON log) instead of registering a
+        listener. File-transfer events get their completion timestamp via
+        ``_update_event_timestamp``.
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._events_dict_lock:
+            self.events_dict.setdefault(sock, []).append([command, timestamp])
+            self._events_dict_size += len(command.encode("utf-8", "replace")) + len(timestamp)
+            if self._events_dict_size >= self.max_dict_size:
+                self._flush_dict_locked(
+                    self.events_dict, "_events_dict_size", self.events_log_file
+                )
+
+    def _update_event_timestamp(self, sock, command, timestamp):
+        """Stamp the completion time onto the recorded event for ``command``.
+
+        File transfers finish on a worker thread after the receive thread
+        recorded the command, so the event's timestamp is refreshed here with
+        the moment the transfer actually completed.
+        """
+        with self._events_dict_lock:
+            entries = self.events_dict.get(sock)
+            if entries:
+                for entry in reversed(entries):
+                    if entry[0] == command:
+                        entry[1] = timestamp
+                        return
+
+    def _splice_event_command(self, command, **parts):
+        """Return the command to record as an event.
+
+        The wire command is recorded verbatim whenever it is available. When
+        this end cannot see the original command (a transfer relayed by the
+        server, or a protocol-internal control line), splice a readable
+        command from the available parts so the event still identifies the
+        transfer.
+        """
+        if command:
+            return command
+        kind = parts.get("kind")
+        fname = parts.get("fname")
+        rel_dir = parts.get("rel_dir")
+        if kind == "folder" and fname:
+            if rel_dir:
+                return "/file_folder {} {}".format(shlex.quote(rel_dir), shlex.quote(fname))
+            return "/file_folder {}".format(shlex.quote(fname))
+        if fname:
+            return "/file {}".format(shlex.quote(fname))
+        return parts.get("fallback") or "/unknown"
+
+    def _flush_dict_locked(self, d, size_attr, path):
+        """Flush ``d`` (socket -> [[content, ts], ...]) into its JSON log and
+        clear it. The caller must hold the dict's lock."""
+        if not d:
+            return
+        snapshot = dict(d)
+        d.clear()
+        setattr(self, size_attr, 0)
+        self._merge_json_log(path, snapshot)
+
+    def _flush_messages_dict(self):
+        with self._messages_dict_lock:
+            self._flush_dict_locked(
+                self.messages_dict, "_messages_dict_size", self.messages_log_file
+            )
+
+    def _flush_events_dict(self):
+        with self._events_dict_lock:
+            self._flush_dict_locked(
+                self.events_dict, "_events_dict_size", self.events_log_file
+            )
+
+    def _merge_json_log(self, path, snapshot):
+        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket)."""
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = {}
+            for sock, entries in snapshot.items():
+                key = self._socket_key(sock)
+                existing.setdefault(key, []).extend(entries)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+        except Exception:
+            traceback.print_exc()
 
     def submit_task(self, func, *args, **kwargs):
         self._task_semaphore.acquire()
@@ -2933,10 +3204,12 @@ class TCP_Client_Base:  # TCP client class
                     if ok:
                         message = plain.strip()
                     if message.startswith("/"):
+                        self._record_event(self.client_socket, message)
                         self.handle_server_command(message)
                     if message:
                         if not message.startswith("/"):
                             self._notify_message_received(message)
+                            self._record_message(self.client_socket, message)
                         print(f"\n[server] {message}")
             except socket.timeout:
                 continue
@@ -4227,6 +4500,11 @@ class TCP_Client_Base:  # TCP client class
                 # ack send must not skip the key registration (readiness
                 # would never be announced and the handshake hangs)
                 self._notify_file_received(full_path, final_filename, file_size, command)
+                self._update_event_timestamp(
+                    client_socket,
+                    self._splice_event_command(command, fname=final_filename),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
                 print(f"file {filename} received from {client_id}, size {file_size} bytes")
                 if command_part[0] == "/crypto_pub_key":
                     self._crypto_store_received_pub(full_path, "server", (self.host, self.port))
@@ -4285,6 +4563,8 @@ class TCP_Client_Base:  # TCP client class
     def close(self):  # close connection
         self.running = False
         self.free_port()
+        self._flush_messages_dict()
+        self._flush_events_dict()
         if self.client_socket:
             self.client_socket.close()
         print("connection closed")
