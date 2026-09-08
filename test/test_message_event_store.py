@@ -131,7 +131,7 @@ def test_server_records_file_transfer_event(pair, tmp_path):
     payload = os.urandom(8192)
     src.write_bytes(payload)
 
-    client.file_transfer_client_recv_client_start_thread(f"/file {src}", None)
+    client.file_transfer_client_recv_client_start_thread(f'/file "{src}"', None)
     assert wait_until(lambda: any(server_recv.iterdir()), timeout=10), "file not received"
     assert list(server_recv.iterdir())[0].read_bytes() == payload
 
@@ -165,8 +165,11 @@ def test_flush_writes_json_and_clears_dict(pair, tmp_path):
     def all_flushed():
         if not os.path.exists(server.messages_log_file):
             return False
-        with open(server.messages_log_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(server.messages_log_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False  # log mid-replace: retry
         in_file = len(data.get(key, []))
         in_dict = len(server.messages_dict.get(_server_sock(server, client), []))
         return in_file + in_dict >= 30

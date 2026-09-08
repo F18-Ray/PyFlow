@@ -542,7 +542,11 @@ class TCP_Server_Base:  # TCP server class
             )
 
     def _merge_json_log(self, path, snapshot):
-        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket)."""
+        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket).
+
+        The file is replaced atomically (temp file + os.replace) so a
+        concurrent reader never sees a truncated/partial log.
+        """
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
@@ -552,8 +556,16 @@ class TCP_Server_Base:  # TCP server class
             for sock, entries in snapshot.items():
                 key = self._socket_key(sock)
                 existing.setdefault(key, []).extend(entries)
-            with open(path, "w", encoding="utf-8") as f:
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
+            for _ in range(5):  # Windows: the log may be briefly open for reading
+                try:
+                    os.replace(tmp_path, path)
+                    return
+                except PermissionError:
+                    time.sleep(0.05)
+            os.replace(tmp_path, path)
         except Exception:
             traceback.print_exc()
 
@@ -2851,7 +2863,11 @@ class TCP_Client_Base:  # TCP client class
             )
 
     def _merge_json_log(self, path, snapshot):
-        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket)."""
+        """Merge ``snapshot`` into the JSON log at ``path`` (append per socket).
+
+        The file is replaced atomically (temp file + os.replace) so a
+        concurrent reader never sees a truncated/partial log.
+        """
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
@@ -2861,8 +2877,16 @@ class TCP_Client_Base:  # TCP client class
             for sock, entries in snapshot.items():
                 key = self._socket_key(sock)
                 existing.setdefault(key, []).extend(entries)
-            with open(path, "w", encoding="utf-8") as f:
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
+            for _ in range(5):  # Windows: the log may be briefly open for reading
+                try:
+                    os.replace(tmp_path, path)
+                    return
+                except PermissionError:
+                    time.sleep(0.05)
+            os.replace(tmp_path, path)
         except Exception:
             traceback.print_exc()
 
