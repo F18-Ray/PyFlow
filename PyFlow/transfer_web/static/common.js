@@ -266,6 +266,8 @@
       '<input type="file" id="file-input" ' +
       (folderMode ? 'webkitdirectory directory multiple' : "multiple") + "></div>" +
       '<div class="file-list" id="file-list"></div>' +
+      '<div class="field"><label>Destination folder (arrival directory on the receiving side)</label>' +
+      '<input type="text" id="dest-input" placeholder="e.g. /home/user/incoming (leave empty for default)"></div>' +
       '<div class="actions"><button class="btn" id="confirm-btn">Send</button> ' +
       '<button class="btn btn-ghost" id="cancel-btn">Cancel</button></div>'
     );
@@ -309,6 +311,8 @@
       if (!target) return;
       const fd = new FormData();
       fd.append("target", JSON.stringify(target));
+      const dest = backdrop.querySelector("#dest-input").value.trim();
+      if (dest) fd.append("destination", dest);
       files.forEach((f) => {
         fd.append("files", f, folderMode ? f.webkitRelativePath || f.name : f.name);
       });

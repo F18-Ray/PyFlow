@@ -138,33 +138,39 @@ class ClientWebApp:
         except Exception:
             traceback.print_exc()
 
-    def _send_file_to_server(self, path):
+    def _send_file_to_server(self, path, destination=None):
         try:
-            self.client.file_transfer_client_recv_client_start(f"/file {shlex.quote(path)}", None)
+            message = f"/file {shlex.quote(path)}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.client.file_transfer_client_recv_client_start(message, None)
         except Exception:
             traceback.print_exc()
 
-    def _send_folder_to_server(self, path):
+    def _send_folder_to_server(self, path, destination=None):
         try:
-            self.client.folder_file_transfer_client_recv_client_start(
-                f"/file_folder {shlex.quote(path)}"
-            )
+            message = f"/file_folder {shlex.quote(path)}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.client.folder_file_transfer_client_recv_client_start(message)
         except Exception:
             traceback.print_exc()
 
-    def _forward_file(self, path, addr):
+    def _forward_file(self, path, addr, destination=None):
         try:
-            self.client.forward_file_console(
-                f"/forward_file {shlex.quote(path)} {shlex.quote(str(addr))}"
-            )
+            message = f"/forward_file {shlex.quote(path)} {shlex.quote(str(addr))}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.client.forward_file_console(message)
         except Exception:
             traceback.print_exc()
 
-    def _forward_folder(self, path, addr):
+    def _forward_folder(self, path, addr, destination=None):
         try:
-            self.client.forward_folder_console(
-                f"/forward_folder {shlex.quote(path)} {shlex.quote(str(addr))}"
-            )
+            message = f"/forward_folder {shlex.quote(path)} {shlex.quote(str(addr))}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.client.forward_folder_console(message)
         except Exception:
             traceback.print_exc()
 
@@ -384,10 +390,14 @@ class ClientWebApp:
         def api_send_file():
             if not self.connected or self.client is None:
                 return jsonify({"ok": False, "error": "not connected"}), 400
-            target = request.form.get("target")
+            try:
+                target = json.loads(request.form.get("target"))
+            except Exception:
+                return jsonify({"ok": False, "error": "invalid target"}), 400
             files = request.files.getlist("files")
             if not files:
                 return jsonify({"ok": False, "error": "no files uploaded"}), 400
+            destination = request.form.get("destination") or None
             os.makedirs(UPLOAD_DIR, exist_ok=True)
             saved = []
             for f in files:
@@ -397,22 +407,28 @@ class ClientWebApp:
             if target == "server":
                 for path in saved:
                     threading.Thread(
-                        target=self._send_file_to_server, args=(path,), daemon=True
+                        target=self._send_file_to_server, args=(path, destination), daemon=True
                     ).start()
             else:
-                addr = tuple(json.loads(target))
+                addr = tuple(target)
                 for path in saved:
-                    threading.Thread(target=self._forward_file, args=(path, addr), daemon=True).start()
+                    threading.Thread(
+                        target=self._forward_file, args=(path, addr, destination), daemon=True
+                    ).start()
             return jsonify({"ok": True})
 
         @app.post("/api/send_folder")
         def api_send_folder():
             if not self.connected or self.client is None:
                 return jsonify({"ok": False, "error": "not connected"}), 400
-            target = request.form.get("target")
+            try:
+                target = json.loads(request.form.get("target"))
+            except Exception:
+                return jsonify({"ok": False, "error": "invalid target"}), 400
             files = request.files.getlist("files")
             if not files:
                 return jsonify({"ok": False, "error": "no files uploaded"}), 400
+            destination = request.form.get("destination") or None
             os.makedirs(UPLOAD_DIR, exist_ok=True)
             root = None
             for f in files:
@@ -426,11 +442,13 @@ class ClientWebApp:
                 return jsonify({"ok": False, "error": "folder upload failed"}), 500
             if target == "server":
                 threading.Thread(
-                    target=self._send_folder_to_server, args=(root,), daemon=True
+                    target=self._send_folder_to_server, args=(root, destination), daemon=True
                 ).start()
             else:
-                addr = tuple(json.loads(target))
-                threading.Thread(target=self._forward_folder, args=(root, addr), daemon=True).start()
+                addr = tuple(target)
+                threading.Thread(
+                    target=self._forward_folder, args=(root, addr, destination), daemon=True
+                ).start()
             return jsonify({"ok": True})
 
         @app.post("/api/run_extension")

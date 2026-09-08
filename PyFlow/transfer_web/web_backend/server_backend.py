@@ -320,19 +320,21 @@ class ServerWebApp:
         except Exception:
             traceback.print_exc()
 
-    def _send_file_to_client(self, target, path):
+    def _send_file_to_client(self, target, path, destination=None):
         try:
-            self.server.file_transfer_server_recv_client_start(
-                f"/file {shlex.quote(path)} {shlex.quote(str(target))}", None
-            )
+            message = f"/file {shlex.quote(path)} {shlex.quote(str(target))}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.server.file_transfer_server_recv_client_start(message, None)
         except Exception:
             traceback.print_exc()
 
-    def _send_folder_to_client(self, target, path):
+    def _send_folder_to_client(self, target, path, destination=None):
         try:
-            self.server.folder_file_transfer_server_recv_client_start(
-                f"/file_folder {shlex.quote(path)} {shlex.quote(str(target))}"
-            )
+            message = f"/file_folder {shlex.quote(path)} {shlex.quote(str(target))}"
+            if destination:
+                message += f" {shlex.quote(destination)}"
+            self.server.folder_file_transfer_server_recv_client_start(message)
         except Exception:
             traceback.print_exc()
 
@@ -437,6 +439,7 @@ class ServerWebApp:
             info = self._target_info(target)
             if info is None:
                 return jsonify({"ok": False, "error": "target client is not connected"}), 404
+            destination = request.form.get("destination") or None
             os.makedirs(UPLOAD_DIR, exist_ok=True)
             saved = []
             for f in files:
@@ -445,7 +448,9 @@ class ServerWebApp:
                 saved.append(path)
             for path in saved:
                 threading.Thread(
-                    target=self._send_file_to_client, args=(tuple(target), path), daemon=True
+                    target=self._send_file_to_client,
+                    args=(tuple(target), path, destination),
+                    daemon=True,
                 ).start()
             return jsonify({"ok": True, "paths": saved})
 
@@ -463,6 +468,7 @@ class ServerWebApp:
             info = self._target_info(target)
             if info is None:
                 return jsonify({"ok": False, "error": "target client is not connected"}), 404
+            destination = request.form.get("destination") or None
             os.makedirs(UPLOAD_DIR, exist_ok=True)
             root = None
             for f in files:
@@ -475,7 +481,9 @@ class ServerWebApp:
             if root is None or not os.path.isdir(root):
                 return jsonify({"ok": False, "error": "folder upload failed"}), 500
             threading.Thread(
-                target=self._send_folder_to_client, args=(tuple(target), root), daemon=True
+                target=self._send_folder_to_client,
+                args=(tuple(target), root, destination),
+                daemon=True,
             ).start()
             return jsonify({"ok": True, "path": root})
 
