@@ -16,6 +16,11 @@ The backend monitors ``server.clients``: whenever a client connects or
 disconnects it broadcasts the current instance list to every connected
 client (``/web_clients_update``), and it re-checks the list every
 minute.
+
+Inbound events (plain-text messages and file uploads arriving from
+clients) are captured on the TCP server's receive threads through
+``TCP_Server_Base``'s ``add_message_listener``/``add_file_listener``
+APIs, queued here, and polled by the frontend via ``/api/events``.
 """
 
 import json
@@ -135,6 +140,9 @@ class ServerWebApp:
         self._last_clients = set()
         self._monitor_stop = threading.Event()
         self._monitor_thread = None
+        self._events = []  # inbound events surfaced to the frontend (/api/events)
+        self._events_lock = threading.Lock()
+        self._event_seq = 0
         self.app = Flask(
             __name__,
             template_folder=TEMPLATE_DIR,
@@ -180,6 +188,8 @@ class ServerWebApp:
         self.server.register_command(
             "/web_sync_clients", self._on_sync_clients, where_to_run="server", run_in_thread=True
         )
+        self.server.add_message_listener(self._on_incoming_message)
+        self.server.add_file_listener(self._on_incoming_file)
         try:
             add_extension.load_registered_extensions(self.server, "server")
         except ImportError as e:
@@ -243,6 +253,54 @@ class ServerWebApp:
         """A client asked for a fresh instance list: broadcast it."""
         self._broadcast_clients()
         return None
+
+    # ------------------------------------------------ inbound event handling
+
+    def _push_event(self, event):
+        """Record an inbound event with a monotonically increasing id."""
+        with self._events_lock:
+            self._event_seq += 1
+            event["id"] = self._event_seq
+            self._events.append(event)
+            if len(self._events) > 1000:
+                del self._events[: len(self._events) - 1000]
+        return self._event_seq
+
+    def _on_incoming_message(self, client_id, text):
+        """Server receive thread: a plain-text message arrived from a client."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._push_event(
+            {"type": "msg", "from": client_id, "text": text, "at": time.strftime("%H:%M:%S")}
+        )
+
+    def _on_incoming_file(self, client_id, full_path, name, size, command):
+        """Server receive thread: a file uploaded by a client was saved."""
+        try:
+            cmd_name = (command or "").strip().split(" ", 1)[0].lower()
+        except Exception:
+            cmd_name = ""
+        if cmd_name == "/crypto_pub_key":  # handshake keys are not user data
+            return
+        rel = full_path
+        if self.server is not None:
+            try:
+                candidate = os.path.relpath(full_path, self.server.file_transfer_dir)
+                if not candidate.startswith(".."):
+                    rel = candidate
+            except Exception:
+                pass
+        self._push_event(
+            {
+                "type": "file",
+                "name": name,
+                "path": rel,
+                "size": size,
+                "from": client_id,
+                "at": time.strftime("%H:%M:%S"),
+            }
+        )
 
     # ---------------------------------------------------------------- helpers
 
@@ -337,6 +395,14 @@ class ServerWebApp:
         @app.get("/api/clients")
         def api_clients():
             return jsonify({"clients": self._client_list()})
+
+        @app.get("/api/events")
+        def api_events():
+            since = request.args.get("since", 0, type=int)
+            with self._events_lock:
+                events = [e for e in self._events if e["id"] > since]
+                latest = events[-1]["id"] if events else since
+            return jsonify({"events": events, "latest": latest})
 
         @app.post("/api/send_msg")
         def api_send_msg():

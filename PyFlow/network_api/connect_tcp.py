@@ -146,6 +146,12 @@ class TCP_Server_Base:  # TCP server class
         self._custom_handler_threaded = [{}, {}]
         self._custom_executor = ThreadPoolExecutor(max_workers=max_custom_workers)
         self._task_semaphore = threading.Semaphore(max_custom_workers)
+        # Inbound-event listeners (see add_message_listener/add_file_listener).
+        # They run on the receive thread, so a listener must not block and must
+        # never raise (exceptions are swallowed by the notify helpers).
+        self._message_listeners = []
+        self._file_listeners = []
+        self._event_listeners_lock = threading.Lock()
         self.is_extend_command = is_extend_command
         self.is_enable_encrypto = is_enable_encrypto
         self.is_custom_keys = is_custom_keys
@@ -360,6 +366,65 @@ class TCP_Server_Base:  # TCP server class
             return False
         self._custom_handlers[registe_index][command_name] = handler
         self._custom_handler_threaded[registe_index][command_name] = run_in_thread
+
+    def add_message_listener(self, listener):
+        """Register ``listener(client_id, message)`` for every inbound plain-text message.
+
+        Plain messages are the chat/data lines received from a client that do
+        not start with ``/``.  ``client_id`` is the sender's ``"ip:port"``.
+        Commands are not reported here; they go through the registered
+        command handlers.
+        """
+        with self._event_listeners_lock:
+            if listener not in self._message_listeners:
+                self._message_listeners.append(listener)
+
+    def remove_message_listener(self, listener):
+        """Unregister a listener previously added by ``add_message_listener``."""
+        with self._event_listeners_lock:
+            try:
+                self._message_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def add_file_listener(self, listener):
+        """Register ``listener(client_id, full_path, name, size, command)`` for each saved inbound file.
+
+        Fired after a file uploaded by a client (a direct send or a forwarded
+        file/folder item staged on the server) has been fully written to
+        ``file_transfer_dir``.  ``client_id`` is the uploader's ``"ip:port"``
+        and ``command`` is the wire command that triggered the transfer, so a
+        listener can recognise protocol pushes such as ``/crypto_pub_key``.
+        """
+        with self._event_listeners_lock:
+            if listener not in self._file_listeners:
+                self._file_listeners.append(listener)
+
+    def remove_file_listener(self, listener):
+        """Unregister a listener previously added by ``add_file_listener``."""
+        with self._event_listeners_lock:
+            try:
+                self._file_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_message_received(self, client_id, message):
+        with self._event_listeners_lock:
+            listeners = list(self._message_listeners)
+        for listener in listeners:
+            try:
+                listener(client_id, message)
+            except Exception:
+                traceback.print_exc()
+
+    def _notify_file_received(self, client_id, full_path, name, size, command):
+        with self._event_listeners_lock:
+            listeners = list(self._file_listeners)
+        for listener in listeners:
+            try:
+                listener(client_id, full_path, name, size, command)
+            except Exception:
+                traceback.print_exc()
 
     def submit_task(self, func, *args, **kwargs):
         self._task_semaphore.acquire()
@@ -910,6 +975,7 @@ class TCP_Server_Base:  # TCP server class
                     if message.startswith("/"):  # deal with special command
                         response = self.handle_command(client_socket, client_address, message)
                     else:
+                        self._notify_message_received(client_id, message)
                         timestamp = datetime.now().strftime("%H:%M:%S")  # deal with normal message
                         log_msg = f"[{timestamp}] {client_id}: {message}"
                         print(log_msg)
@@ -1327,6 +1393,7 @@ class TCP_Server_Base:  # TCP server class
                 # TOFU first: the ack is only a notification, and a failed
                 # ack send must not skip the key registration (the server
                 # would never announce readiness and the handshake hangs)
+                self._notify_file_received(client_id, full_path, final_filename, file_size, command)
                 print(f"file {filename} received from {client_id}, size {file_size} bytes")
                 if command_part[0] == "/crypto_pub_key":
                     with self._crypto_lock:
@@ -2413,6 +2480,12 @@ class TCP_Client_Base:  # TCP client class
         self._custom_handler_threaded = [{}, {}]
         self._custom_executor = ThreadPoolExecutor(max_workers=max_custom_workers)
         self._task_semaphore = threading.Semaphore(max_custom_workers)
+        # Inbound-event listeners (see add_message_listener/add_file_listener).
+        # They run on the receive thread, so a listener must not block and must
+        # never raise (exceptions are swallowed by the notify helpers).
+        self._message_listeners = []
+        self._file_listeners = []
+        self._event_listeners_lock = threading.Lock()
         self.is_extend_command = is_extend_command
         self.is_enable_encrypto = is_enable_encrypto
         self.is_custom_keys = is_custom_keys
@@ -2463,6 +2536,64 @@ class TCP_Client_Base:  # TCP client class
             return False
         self._custom_handlers[registe_index][command_name] = handler
         self._custom_handler_threaded[registe_index][command_name] = run_in_thread
+
+    def add_message_listener(self, listener):
+        """Register ``listener(message: str)`` for every inbound plain-text message.
+
+        Plain messages are the chat/data lines received from the server that
+        do not start with ``/`` (direct sends from the server, messages
+        forwarded from other clients, protocol replies).  Commands are not
+        reported here; they go through the registered command handlers.
+        """
+        with self._event_listeners_lock:
+            if listener not in self._message_listeners:
+                self._message_listeners.append(listener)
+
+    def remove_message_listener(self, listener):
+        """Unregister a listener previously added by ``add_message_listener``."""
+        with self._event_listeners_lock:
+            try:
+                self._message_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def add_file_listener(self, listener):
+        """Register ``listener(full_path, name, size, command)`` for each saved inbound file.
+
+        Fired after a file pushed by the server (a direct send, a forwarded
+        file or folder item) has been fully written to ``file_transfer_dir``.
+        ``command`` is the wire command that triggered the transfer, so a
+        listener can recognise protocol pushes such as ``/crypto_pub_key``.
+        """
+        with self._event_listeners_lock:
+            if listener not in self._file_listeners:
+                self._file_listeners.append(listener)
+
+    def remove_file_listener(self, listener):
+        """Unregister a listener previously added by ``add_file_listener``."""
+        with self._event_listeners_lock:
+            try:
+                self._file_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def _notify_message_received(self, message):
+        with self._event_listeners_lock:
+            listeners = list(self._message_listeners)
+        for listener in listeners:
+            try:
+                listener(message)
+            except Exception:
+                traceback.print_exc()
+
+    def _notify_file_received(self, full_path, name, size, command):
+        with self._event_listeners_lock:
+            listeners = list(self._file_listeners)
+        for listener in listeners:
+            try:
+                listener(full_path, name, size, command)
+            except Exception:
+                traceback.print_exc()
 
     def submit_task(self, func, *args, **kwargs):
         self._task_semaphore.acquire()
@@ -2804,6 +2935,8 @@ class TCP_Client_Base:  # TCP client class
                     if message.startswith("/"):
                         self.handle_server_command(message)
                     if message:
+                        if not message.startswith("/"):
+                            self._notify_message_received(message)
                         print(f"\n[server] {message}")
             except socket.timeout:
                 continue
@@ -4093,6 +4226,7 @@ class TCP_Client_Base:  # TCP client class
                 # TOFU first: the ack is only a notification, and a failed
                 # ack send must not skip the key registration (readiness
                 # would never be announced and the handshake hangs)
+                self._notify_file_received(full_path, final_filename, file_size, command)
                 print(f"file {filename} received from {client_id}, size {file_size} bytes")
                 if command_part[0] == "/crypto_pub_key":
                     self._crypto_store_received_pub(full_path, "server", (self.host, self.port))

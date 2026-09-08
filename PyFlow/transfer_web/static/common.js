@@ -15,6 +15,7 @@
     target: null, // "server" | [ip, port]
     extensions: [], // [{name, icon, command}]
     messages: [], // [{dir: "out"|"sys", text}]
+    eventId: 0, // last inbound event id consumed from /api/events
   };
 
   /* ---------------- helpers ---------------- */
@@ -54,6 +55,18 @@
     return target[0] + ":" + target[1];
   }
 
+  function fmtSize(n) {
+    if (n == null || isNaN(n)) return "?";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let v = Number(n);
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + units[i];
+  }
+
   function isSelf(entry) {
     return (
       state.ownAddress &&
@@ -76,14 +89,11 @@
     serverEntry.addEventListener("click", () => selectTarget("server"));
     list.appendChild(serverEntry);
 
-    if (!state.clients.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty-hint";
-      empty.style.padding = "16px 8px";
-      empty.textContent = "No clients connected";
-      list.appendChild(empty);
-    }
+    let shown = 0;
     state.clients.forEach((c) => {
+      // a client never lists itself; the server is never in the client list
+      if (MODE === "client" && isSelf(c)) return;
+      shown++;
       const el = document.createElement("div");
       const key = c.ip + ":" + c.port;
       const active =
@@ -92,14 +102,20 @@
         state.target[0] === c.ip &&
         state.target[1] === c.port;
       el.className = "instance" + (active ? " active" : "");
-      const self = isSelf(c);
       el.innerHTML =
-        '<span class="dot client' + (self ? " self" : "") + '"></span>' +
-        '<span class="name">' + esc(key) + (self ? " (me)" : "") + "</span>" +
-        '<span class="tag">' + (self ? "me" : "client") + "</span>";
+        '<span class="dot client"></span>' +
+        '<span class="name">' + esc(key) + "</span>" +
+        '<span class="tag">client</span>';
       el.addEventListener("click", () => selectTarget([c.ip, c.port]));
       list.appendChild(el);
     });
+    if (!shown) {
+      const empty = document.createElement("div");
+      empty.className = "empty-hint";
+      empty.style.padding = "16px 8px";
+      empty.textContent = "No clients connected";
+      list.appendChild(empty);
+    }
   }
 
   function selectTarget(target) {
@@ -147,6 +163,35 @@
       const conn = $("conn-indicator");
       conn.textContent = "offline";
       conn.className = "conn off";
+    }
+  }
+
+  /* ---------------- inbound events ---------------- */
+
+  async function refreshEvents() {
+    let data;
+    try {
+      data = await api("/api/events?since=" + state.eventId);
+    } catch (e) {
+      return; // offline or a backend without the endpoint
+    }
+    let rendered = 0;
+    (data.events || []).forEach((ev) => {
+      if (ev.id) state.eventId = Math.max(state.eventId, ev.id);
+      const from = ev.from ? ev.from + ": " : "";
+      if (ev.type === "msg") {
+        addMessage("in", from + ev.text);
+        rendered++;
+      } else if (ev.type === "file") {
+        const size = fmtSize(ev.size);
+        addMessage("in", from + "file received: " + ev.name + " (" + size + ") -> " + ev.path);
+        toast("File received: " + ev.name + " (" + size + ")", "ok");
+        rendered++;
+      }
+    });
+    if (rendered && MODE === "server") {
+      const hint = $("empty-hint");
+      if (hint) hint.style.display = "none";
     }
   }
 
@@ -471,7 +516,9 @@
     selectTarget("server");
     loadExtensions();
     refreshStatus();
+    refreshEvents();
     setInterval(refreshStatus, 2000);
+    setInterval(refreshEvents, 2000);
   }
 
   if (document.readyState === "loading") {

@@ -15,6 +15,12 @@ stays up to relay the user's frontend actions:
 The sidebar instance list is kept fresh by the server's
 ``/web_clients_update`` broadcasts; a reload button re-requests the
 list via ``/web_sync_clients``.
+
+Inbound events (plain-text messages and files pushed by the server,
+whether direct sends or client forwards) are captured on the TCP
+client's receive threads through ``TCP_Client_Base``'s
+``add_message_listener``/``add_file_listener`` APIs, queued here, and
+polled by the frontend via ``/api/events``.
 """
 
 import json
@@ -94,6 +100,11 @@ class ClientWebApp:
         self._last_address = ""
         self._clients = []
         self._clients_lock = threading.Lock()
+        self._events = []  # inbound events surfaced to the frontend (/api/events)
+        self._events_lock = threading.Lock()
+        self._event_seq = 0
+        self._echo_expect = None  # plain text last sent to the server (echo suppression)
+        self._echo_expect_at = 0.0
         self.app = Flask(
             __name__,
             template_folder=TEMPLATE_DIR,
@@ -173,6 +184,62 @@ class ClientWebApp:
                 self._clients = clients
         return None
 
+    # ------------------------------------------------ inbound event handling
+
+    def _push_event(self, event):
+        """Record an inbound event with a monotonically increasing id."""
+        with self._events_lock:
+            self._event_seq += 1
+            event["id"] = self._event_seq
+            self._events.append(event)
+            if len(self._events) > 1000:
+                del self._events[: len(self._events) - 1000]
+        return self._event_seq
+
+    def _on_incoming_message(self, text):
+        """Client receive thread: a plain-text message arrived from the server."""
+        text = (text or "").strip()
+        if not text:
+            return
+        if text.startswith("Welcome!:"):  # connection greeting, not chat
+            return
+        if text == "Command received, processing in background.":  # server ack, not chat
+            return
+        if text.startswith("Unknown command"):  # server rejection notice, not chat
+            return
+        if text.startswith("msg send: "):  # echo of our own plain send to the server
+            with self._events_lock:
+                expect, at = self._echo_expect, self._echo_expect_at
+            if expect is not None and time.time() - at <= 3 and text == "msg send: " + expect:
+                return
+        self._push_event({"type": "msg", "text": text, "at": time.strftime("%H:%M:%S")})
+
+    def _on_incoming_file(self, full_path, name, size, command):
+        """Client receive thread: a file pushed by the server was saved."""
+        try:
+            cmd_name = (command or "").strip().split(" ", 1)[0].lower()
+        except Exception:
+            cmd_name = ""
+        if cmd_name == "/crypto_pub_key":  # handshake keys are not user data
+            return
+        rel = full_path
+        if self.client is not None:
+            try:
+                candidate = os.path.relpath(full_path, self.client.file_transfer_dir)
+                if not candidate.startswith(".."):
+                    rel = candidate
+            except Exception:
+                pass
+        self._push_event(
+            {
+                "type": "file",
+                "name": name,
+                "path": rel,
+                "size": size,
+                "at": time.strftime("%H:%M:%S"),
+            }
+        )
+
     # ---------------------------------------------------------------- connect
 
     def _start_client(self, host, port, is_enable_encrypto):
@@ -196,6 +263,8 @@ class ClientWebApp:
         self.client.register_command(
             "/web_clients_update", self._on_clients_update, where_to_run="server", run_in_thread=True
         )
+        self.client.add_message_listener(self._on_incoming_message)
+        self.client.add_file_listener(self._on_incoming_file)
         try:
             add_extension.load_registered_extensions(self.client, "client")
         except ImportError as e:
@@ -278,6 +347,14 @@ class ClientWebApp:
                 }
             )
 
+        @app.get("/api/events")
+        def api_events():
+            since = request.args.get("since", 0, type=int)
+            with self._events_lock:
+                events = [e for e in self._events if e["id"] > since]
+                latest = events[-1]["id"] if events else since
+            return jsonify({"events": events, "latest": latest})
+
         @app.post("/api/send_msg")
         def api_send_msg():
             if not self.connected or self.client is None:
@@ -289,6 +366,9 @@ class ClientWebApp:
                 ok = self.client.send_message(self.client.client_socket, message)
                 if not ok:
                     return jsonify({"ok": False, "error": "send failed"}), 500
+                with self._events_lock:
+                    self._echo_expect = message
+                    self._echo_expect_at = time.time()
                 return jsonify({"ok": True})
             addr = (target[0], int(target[1]))
             handler = self.client._custom_handlers[1].get("/send_msg_forward")
