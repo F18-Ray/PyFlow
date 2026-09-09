@@ -8,9 +8,10 @@ and port, then starts the ``TCP_Client_Base`` instance.  The backend
 stays up to relay the user's frontend actions:
 
 - messages/files/folders to the server use the native transfer methods;
-- messages to other clients are forwarded through the built-in
-  ``forward_extension_tcp`` extension (string forwarding lives there);
-- files/folders to other clients use the native forward methods.
+- messages to other clients use the native ``/forward_send_msg`` forwarding
+  (a client-only command relayed by the server);
+- files/folders to other clients are forwarded through the built-in
+  ``forward_extension_tcp`` extension.
 
 The sidebar instance list is kept fresh by the server's
 ``/web_clients_update`` broadcasts; a reload button re-requests the
@@ -202,8 +203,14 @@ class ClientWebApp:
                 del self._events[: len(self._events) - 1000]
         return self._event_seq
 
-    def _on_incoming_message(self, text):
-        """Client receive thread: a plain-text message arrived from the server."""
+    def _on_incoming_message(self, sender, text):
+        """Client receive thread: an inbound plain-text message.
+
+        ``sender`` is the author's ``"ip:port"`` when another client forwarded
+        the message to us (the server relay envelope carries it), or ``None``
+        for a direct push from the server. Direct pushes surface under the
+        server entry; forwarded ones under the sender's own conversation.
+        """
         text = (text or "").strip()
         if not text:
             return
@@ -218,7 +225,10 @@ class ClientWebApp:
                 expect, at = self._echo_expect, self._echo_expect_at
             if expect is not None and time.time() - at <= 3 and text == "msg send: " + expect:
                 return
-        self._push_event({"type": "msg", "text": text, "at": time.strftime("%H:%M:%S")})
+        event = {"type": "msg", "text": text, "at": time.strftime("%H:%M:%S")}
+        if sender:
+            event["from"] = sender
+        self._push_event(event)
 
     def _on_incoming_file(self, full_path, name, size, command):
         """Client receive thread: a file pushed by the server was saved."""
@@ -377,12 +387,8 @@ class ClientWebApp:
                     self._echo_expect_at = time.time()
                 return jsonify({"ok": True})
             addr = (target[0], int(target[1]))
-            handler = self.client._custom_handlers[1].get("/send_msg_forward")
-            if handler is None:
-                return jsonify({"ok": False, "error": "forward extension is not loaded"}), 500
-            command = f"/send_msg_forward {shlex.quote(message)} {shlex.quote(str(addr))}"
             threading.Thread(
-                target=self._run_client_command, args=(handler, command), daemon=True
+                target=self.client.forward_messages, args=([message], [addr]), daemon=True
             ).start()
             return jsonify({"ok": True})
 

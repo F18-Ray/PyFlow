@@ -72,6 +72,62 @@ def _parse_destination_path(command_part):
     return None
 
 
+def parse_forwarded_message(command):
+    """Split a ``/send_msg_from <addr> <payload>`` relay envelope.
+
+    The forward extension's server relay wraps every forwarded message
+    with the sender's address so the receiving client can attribute it
+    to the sending instance (the web tool shows it in the sender's
+    conversation). Returns ``(sender_id, payload)`` where ``sender_id``
+    is the sender's ``"ip:port"``, or ``None`` when the command is not a
+    well-formed envelope.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if len(parts) < 3 or parts[0].lower() != "/send_msg_from":
+        return None
+    try:
+        sender = ast.literal_eval(parts[1])
+    except (ValueError, SyntaxError):
+        return None
+    if not (isinstance(sender, tuple) and len(sender) == 2 and isinstance(sender[0], str)):
+        return None
+    return f"{sender[0]}:{sender[1]}", " ".join(parts[2:])
+
+
+def parse_forward_items_and_addrs(tokens):
+    """Split forward-command tokens into (items, destination addresses).
+
+    A token of the form ``('ip', port)`` is a destination; anything else is
+    a forwarded item (message text or a path). Shared by the native
+    message forwarding (``/forward_send_msg``) and the file/folder forward
+    extension.
+    """
+    items = []
+    addrs = []
+    for token in tokens:
+        if token.startswith("(") and token.endswith(")"):
+            try:
+                addr = ast.literal_eval(token)
+            except (ValueError, SyntaxError):
+                items.append(token)
+                continue
+            if isinstance(addr, tuple) and len(addr) == 2 and isinstance(addr[0], str):
+                addrs.append(addr)
+            else:
+                items.append(token)
+        else:
+            items.append(token)
+    return items, addrs
+
+
+def forward_skip_message(target):
+    """Console notice for a forward destination that cannot be served."""
+    return f"forward: destination {target} is unreachable or is the server, skipped"
+
+
 class TCP_Server_Base:  # TCP server class
     def __init__(
         self,
@@ -1222,6 +1278,16 @@ class TCP_Server_Base:  # TCP server class
                 daemon=True,
             ).start()
             return None
+        elif shlex.split(command.lower())[0] == "/forward_send_msg":
+            # Internal relay request typed on a client console (client-only
+            # command, same name on the wire): push the messages to the
+            # listed destinations.
+            threading.Thread(
+                target=self._handle_forward_send_msg,
+                args=(client_socket, client_address, command),
+                daemon=True,
+            ).start()
+            return "Command received, processing in background.\n"
         elif shlex.split(command.lower())[0] == "/pause_trans":
             self._forward_pause_target(client_address, command)
             return None
@@ -1331,6 +1397,38 @@ class TCP_Server_Base:  # TCP server class
                     return response
             else:
                 print(f"Unknown command: {command}")
+
+    def _handle_forward_send_msg(self, sock, addr, cmd):
+        """Relay plain messages to every reachable destination client.
+
+        Server side of the client-only ``/forward_send_msg`` command (typed on
+        a client console and relayed here over the wire). Every message is
+        wrapped in a ``/send_msg_from <addr> <payload>`` envelope carrying the
+        originator's address so receivers can attribute it. The messages are
+        recorded under the originator's socket (``sock``), exactly as if the
+        originator had sent them to the server. Destinations that are
+        unreachable -- or the server itself, which is never in the client
+        table -- are skipped and the rest are still served.
+        """
+        parts = shlex.split(cmd)
+        items, addrs = parse_forward_items_and_addrs(parts[1:])
+        reached = False
+        for target in addrs:
+            client_info = self.clients.get(target)
+            if client_info is None:
+                print(forward_skip_message(target))
+                continue
+            reached = True
+            target_socket = client_info["socket"]
+            for msg in items:
+                self.send_message(
+                    target_socket,
+                    f"/send_msg_from {shlex.quote(repr(addr))} {shlex.quote(msg)}",
+                )
+        if reached:
+            for msg in items:
+                self._record_message(sock, msg)
+        return None
 
     def _execute_custom_handler(self, handler, command, client_socket=None, client_address=None):
         try:
@@ -2467,7 +2565,11 @@ class TCP_Server_Base:  # TCP server class
                     self.diff_multiple_file_diff_multiple_client_transfer_server_recv_client_start(
                         deal_cmd
                     )
-                elif shlex.split(deal_cmd)[0].lower() in ("/forward_file", "/forward_folder"):
+                elif shlex.split(deal_cmd)[0].lower() in (
+                    "/forward_send_msg",
+                    "/forward_file",
+                    "/forward_folder",
+                ):
                     print(
                         "forward commands are client-only; "
                         "run them on a client console, not on the server"
@@ -2704,12 +2806,14 @@ class TCP_Client_Base:  # TCP client class
         self._custom_handler_threaded[registe_index][command_name] = run_in_thread
 
     def add_message_listener(self, listener):
-        """Register ``listener(message: str)`` for every inbound plain-text message.
+        """Register ``listener(sender_id, message)`` for every inbound message.
 
-        Plain messages are the chat/data lines received from the server that
-        do not start with ``/`` (direct sends from the server, messages
-        forwarded from other clients, protocol replies).  Commands are not
-        reported here; they go through the registered command handlers.
+        ``sender_id`` is the author's ``"ip:port"``: the forwarding client for
+        messages another client forwarded to this one (``/send_msg_from``
+        envelopes), or ``None`` for direct pushes from the server, which do
+        not identify a client author. Commands are not reported here; they go
+        through the registered command handlers. Mirrors the server-side
+        contract (``listener(client_id, message)``).
         """
         with self._event_listeners_lock:
             if listener not in self._message_listeners:
@@ -2743,12 +2847,12 @@ class TCP_Client_Base:  # TCP client class
             except ValueError:
                 pass
 
-    def _notify_message_received(self, message):
+    def _notify_message_received(self, sender, message):
         with self._event_listeners_lock:
             listeners = list(self._message_listeners)
         for listener in listeners:
             try:
-                listener(message)
+                listener(sender, message)
             except Exception:
                 traceback.print_exc()
 
@@ -3227,13 +3331,26 @@ class TCP_Client_Base:  # TCP client class
                     ok, plain = self._crypto_process_line(self.client_socket, message)
                     if ok:
                         message = plain.strip()
+                    sender = None  # the author's "ip:port"; None for direct server pushes
                     if message.startswith("/"):
-                        self._record_event(self.client_socket, message)
-                        self.handle_server_command(message)
+                        # A /send_msg_from envelope is a message that another
+                        # client forwarded to us: its records belong to the
+                        # originator, whose socket exists only on the server, so
+                        # the originator's address is the store key here. The
+                        # payload then flows through the single plain-message
+                        # path below (notify + store + print).
+                        unwrapped = parse_forwarded_message(message)
+                        if unwrapped is not None:
+                            raw = message
+                            sender, message = unwrapped
+                            self._record_event(sender, raw)
+                        else:
+                            self._record_event(self.client_socket, message)
+                            self.handle_server_command(message)
                     if message:
                         if not message.startswith("/"):
-                            self._notify_message_received(message)
-                            self._record_message(self.client_socket, message)
+                            self._notify_message_received(sender, message)
+                            self._record_message(sender or self.client_socket, message)
                         print(f"\n[server] {message}")
             except socket.timeout:
                 continue
@@ -3787,6 +3904,36 @@ class TCP_Client_Base:  # TCP client class
             else:
                 print(f"Unknown server command: {command}")
 
+    def _console_forward_send_msg(self, command):
+        """Client console entry point for ``/forward_send_msg`` (client-only).
+
+        The forwarding command is only meaningful on a client: it parses the
+        typed request and asks the server (which runs the same-named relay)
+        to push each message to every listed destination.
+        """
+        parts = shlex.split(command)
+        items, addrs = parse_forward_items_and_addrs(parts[1:])
+        if not items or not addrs:
+            print(
+                "forward_send_msg: need at least one message and one destination, "
+                'e.g. /forward_send_msg "msg" "(\'127.0.0.1\', 3000)"'
+            )
+            return None
+        return self.forward_messages(items, addrs)
+
+    def forward_messages(self, messages, addrs):
+        """Forward plain messages to other connected clients through the server.
+
+        Internal protocol feature (the client console command
+        ``/forward_send_msg``): this client must be connected. Each message is
+        sent to every destination over the server, wrapped there in a
+        ``/send_msg_from`` envelope so the receiver can attribute it back to
+        this client. ``addrs`` is a list of ``(ip, port)`` tuples.
+        """
+        request = "/forward_send_msg " + " ".join(shlex.quote(m) for m in messages)
+        request += " " + " ".join(shlex.quote(str(a)) for a in addrs)
+        return self.send_message(self.client_socket, request)
+
     def _execute_custom_handler(self, handler, command, client_socket=None, client_address=None):
         try:
             result = handler(client_socket, client_address, command)
@@ -3835,6 +3982,9 @@ class TCP_Client_Base:  # TCP client class
                             self.forward_file_console(message)
                         elif shlex.split(message.lower())[0] == "/forward_folder":
                             self.forward_folder_console(message)
+                        elif shlex.split(message.lower())[0] == "/forward_send_msg":
+                            # client-only message forwarding: relayed by the server
+                            self._console_forward_send_msg(message)
                         else:
                             cmd_name = message[0].lower()
                             if cmd_name in self._custom_handlers[1]:

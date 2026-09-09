@@ -1,4 +1,10 @@
-"""Tests for the TCP forward extension (forward_extension_tcp.py)."""
+"""Tests for the file/folder forward extension (forward_extension_tcp.py).
+
+Plain-message forwarding (the client-only command ``/forward_send_msg``)
+is native to the TCP protocol and covered by
+``test_forward_msg_attribution.py``; this file covers the extension's
+file and folder transfers plus the internal message command's placement.
+"""
 
 import os
 import socket
@@ -42,21 +48,16 @@ def test_parse_items_and_addrs_rejects_malformed_tuple():
     assert addrs == []
 
 
-def test_send_msg_forward_relays_to_reachable_only(server, dummy_client_socket, capsys):
-    fwd.server_instance = server
-    server.running = True
-    reachable = ("127.0.0.1", 12345)
-    server.clients[reachable] = {"socket": dummy_client_socket}
-    fwd._forward_send_msg_handler(
-        None,
-        None,
-        "/forward_send_msg \"111\" \"222\" \"('127.0.0.1', 12345)\" \"('127.0.0.1', 99999)\"",
-    )
-    sent = dummy_client_socket.data.decode("utf-8")
-    assert "111" in sent
-    assert "222" in sent
-    assert "99999" not in sent
-    assert "skipped" in capsys.readouterr().out
+def test_message_forward_command_is_internal(client, server):
+    """The single ``/forward_send_msg`` command is internal, not an extension:
+    not registered in the handler registry on either side, and the deleted
+    ``/send_msg_forward`` name is gone."""
+    assert "/forward_send_msg" not in server._custom_handlers[0]
+    assert "/forward_send_msg" not in server._custom_handlers[1]
+    assert "/forward_send_msg" not in client._custom_handlers[0]
+    assert "/forward_send_msg" not in client._custom_handlers[1]
+    assert "/send_msg_forward" not in client._custom_handlers[1]
+    assert "/send_msg_forward" not in client._custom_handlers[0]
 
 
 def test_file_forward_relay_skips_unreachable(server, monkeypatch, capsys, tmp_path):
@@ -114,22 +115,43 @@ def test_forward_commands_are_client_only(client, server):
         assert cmd in client._custom_handlers[1]  # client console triggers it
         assert cmd not in server._custom_handlers[1]  # server console rejects it
         assert cmd not in client._custom_handlers[0]
-    for relay in ("/forward_send_msg", "/forward_file", "/forward_folder"):
+    for relay in ("/forward_file", "/forward_folder"):
         assert relay in server._custom_handlers[0]  # client requests reach it
+    assert "/send_msg_forward" not in fwd._FORWARD_COMMANDS
 
 
-def test_send_msg_forward_asks_server(client, monkeypatch):
-    fwd.setup_client_commands(client)
+def test_forward_messages_public_api(client, monkeypatch):
+    """forward_messages() builds the /forward_send_msg relay request."""
     client.client_socket = DummySocket()
     sent = []
     monkeypatch.setattr(client, "send_message", lambda sock, msg: sent.append(msg) or True)
-    handler = client._custom_handlers[1]["/send_msg_forward"]
-    handler(None, None, '/send_msg_forward "111" "222" "(\'127.0.0.1\', 3000)"')
+    client.forward_messages(["111", "222"], [("127.0.0.1", 3000)])
     assert len(sent) == 1
     request = sent[0]
     assert request.startswith("/forward_send_msg")
     assert "111" in request and "222" in request
     assert "127.0.0.1" in request and "3000" in request
+
+
+def test_forward_send_msg_relays_to_reachable_only(server, dummy_client_socket, capsys):
+    """The native /forward_send_msg relay wraps each message with the
+    originator's address and records it under the originator's socket."""
+    server.running = True
+    origin_sock = DummySocket()
+    origin_addr = ("127.0.0.1", 54321)
+    reachable = ("127.0.0.1", 12345)
+    server.clients[reachable] = {"socket": dummy_client_socket}
+    server._handle_forward_send_msg(
+        origin_sock,
+        origin_addr,
+        "/forward_send_msg \"111\" \"222\" \"('127.0.0.1', 12345)\" \"('127.0.0.1', 99999)\"",
+    )
+    sent = dummy_client_socket.data.decode("utf-8")
+    assert "111" in sent and "222" in sent
+    assert "99999" not in sent
+    assert "skipped" in capsys.readouterr().out
+    recorded = [e[0] for e in server.messages_dict.get(origin_sock, [])]
+    assert "111" in recorded and "222" in recorded
 
 
 def test_file_forward_uploads_then_asks_server(client, monkeypatch, tmp_path):
@@ -180,15 +202,13 @@ def test_folder_forward_uploads_sync_then_asks_server(client, monkeypatch, tmp_p
     assert "data_folder" in sent[-1]
 
 
-def test_forward_without_items_or_addrs_prints_usage(client, monkeypatch, capsys):
-    fwd.setup_client_commands(client)
+def test_console_forward_without_items_or_addrs_prints_usage(client, monkeypatch, capsys):
     client.client_socket = DummySocket()
     sent = []
     monkeypatch.setattr(client, "send_message", lambda sock, msg: sent.append(msg) or True)
-    handler = client._custom_handlers[1]["/send_msg_forward"]
-    handler(None, None, "/send_msg_forward")
+    client._console_forward_send_msg("/forward_send_msg")
     assert sent == []
-    assert "need at least one item" in capsys.readouterr().out
+    assert "need at least one message" in capsys.readouterr().out
 
 
 def test_single_variant_rejects_multiple_items(client, monkeypatch, capsys):
@@ -217,8 +237,33 @@ def test_server_setup_creates_instance(monkeypatch, tmp_path, capsys):
     fwd.server_setup()
     assert created and created[0]["is_extend_command"] is True
     assert fwd.server_instance is not None
-    for relay in ("/forward_send_msg", "/forward_file", "/forward_folder"):
+    for relay in ("/forward_file", "/forward_folder"):
         assert relay in fwd.server_instance._custom_handlers[0]
+    # the message relay is internal and needs no extension setup
+    assert "/forward_send_msg" not in fwd.server_instance._custom_handlers[0]
+
+
+def test_server_dispatches_forward_send_msg_internally(server, capsys):
+    """/forward_send_msg arriving over the wire is routed by handle_command's
+    built-in chain (no extension registration involved)."""
+    from test_util import wait_until
+
+    server.running = True
+    dest = DummySocket()
+    reachable = ("127.0.0.1", 12345)
+    server.clients[reachable] = {"socket": dest}
+    origin_sock = DummySocket()
+    try:
+        ack = server.handle_command(
+            origin_sock,
+            ("127.0.0.1", 54321),
+            "/forward_send_msg \"111\" \"('127.0.0.1', 12345)\" \"('127.0.0.1', 99999)\"",
+        )
+        assert ack == "Command received, processing in background.\n"
+        assert wait_until(lambda: b"111" in dest.data), f"never relayed: {dest.data!r}"
+        assert "skipped" in capsys.readouterr().out
+    finally:
+        server.running = False
 
 
 def test_server_setup_with_existing_instance_threaded(monkeypatch):
@@ -238,7 +283,7 @@ def test_server_setup_with_existing_instance_threaded(monkeypatch):
     try:
         fwd.server_setup(instance=s, is_input_command_in_console=False)
         assert fwd.server_instance is s
-        for relay in ("/forward_send_msg", "/forward_file", "/forward_folder"):
+        for relay in ("/forward_file", "/forward_folder"):
             assert relay in s._custom_handlers[0]
         for _ in range(50):
             if s.running:

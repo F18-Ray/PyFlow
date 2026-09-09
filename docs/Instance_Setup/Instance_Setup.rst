@@ -155,11 +155,16 @@ entry sets ``is_extend_command=True``:
 
 - ``command_control_extension_tcp.py`` – remote command
 execution with per-client log collection (``/command``).
-- ``forward_extension_tcp.py`` – forwarding messages,
-files, multiple files, folders and multiple folders to
-any number of destination clients (``/send_msg_forward``,
-``/file_forward``, ``/multiple_file_forward``,
-``/folder_forward``, ``/multiple_folder_forward``).
+- ``forward_extension_tcp.py`` – forwarding files,
+multiple files, folders and multiple folders to any
+number of destination clients (``/file_forward``,
+``/multiple_file_forward``, ``/folder_forward``,
+``/multiple_folder_forward``).
+
+Plain-message forwarding is native to the TCP protocol
+(no extension needed): the client-only command
+``/forward_send_msg`` relays messages to the listed
+destination clients through the server.
 
 With ``is_extend_command=False`` (the default) only the
 raw TCP protocol is started.

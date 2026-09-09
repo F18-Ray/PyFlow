@@ -1,12 +1,18 @@
 """Forward extension for the TCP protocol.
 
-Lets a client forward the data it would normally send to the server
-(strings, files, multiple files, folders, multiple folders) to a list of
-destination clients instead. Every transfer family of the main TCP
-protocol gets a matching ``/xxx_forward`` command:
+Disk-based, upload-then-push forwarding of files and folders to a list of
+destination clients. This is deliberately a second implementation of file
+forwarding: the native TCP protocol already streams files and folders in
+memory (``/forward_file`` / ``/forward_folder`` on a client console,
+relayed by the server as ``/forward_item`` with no disk I/O on the
+server), while this extension uploads the data to the server's transfer
+directory first and then asks the server to push the stored copies.
+Plain-message forwarding is native as well (the client-only command
+``/forward_send_msg``, relayed by the server), so no string forwarding
+lives here.
 
-  /send_msg_forward <msg1> <msg2> ... <(ip, port)> ...
-      forward the messages to every listed destination
+Transfer families added by this extension:
+
   /file_forward <file_path> <(ip, port)> ...
       forward one file to every listed destination
   /multiple_file_forward <file1> <file2> ... <(ip, port)> ...
@@ -32,57 +38,32 @@ the client table) are skipped and the remaining destinations are still
 served.
 """
 
-import ast
 import functools
 import os
 import shlex
 import threading
 
 from .network_api import connect_tcp
+from .network_api.connect_tcp import (
+    forward_skip_message as _server_skip_message,
+    parse_forward_items_and_addrs as _parse_items_and_addrs,
+)
 
 server_instance = None
 client_instance = None
 
 _FORWARD_COMMANDS = (
-    "/send_msg_forward",
     "/file_forward",
     "/multiple_file_forward",
     "/folder_forward",
     "/multiple_folder_forward",
 )
 
-_ADDRESS_LEN = 2  # (host, port) tuple shape
-
 # client command kind -> the relay command the server receives
 _RELAY_FOR_KIND = {
-    "send_msg": "/forward_send_msg",
     "file": "/forward_file",
     "folder": "/forward_folder",
 }
-
-
-def _parse_items_and_addrs(tokens):
-    """Split command tokens into (items, addresses).
-
-    A token of the form ``('ip', port)`` is a destination; anything else
-    is a forwarded item (message text or a path).
-    """
-    items = []
-    addrs = []
-    for token in tokens:
-        if token.startswith("(") and token.endswith(")"):
-            try:
-                addr = ast.literal_eval(token)
-            except (ValueError, SyntaxError):
-                items.append(token)
-                continue
-            if isinstance(addr, tuple) and len(addr) == _ADDRESS_LEN and isinstance(addr[0], str):
-                addrs.append(addr)
-            else:
-                items.append(token)
-        else:
-            items.append(token)
-    return items, addrs
 
 
 def _server_send(message):
@@ -94,7 +75,7 @@ def _server_send(message):
 
 
 def _forward_request(command, names, addrs):
-    """Ask the server to push ``names`` (messages or stored paths) to ``addrs``."""
+    """Ask the server to push ``names`` (stored paths) to ``addrs``."""
     request = command + " " + " ".join(shlex.quote(n) for n in names)
     request += " " + " ".join(shlex.quote(str(a)) for a in addrs)
     return _server_send(request)
@@ -153,8 +134,8 @@ def _upload_folders_sync(paths):
 def _client_forward_handler(kind, allow_multiple, sock, addr, cmd):
     """Console entry point for the /xxx_forward commands (client only).
 
-    The command name never matters here: ``kind`` ("send_msg", "file" or
-    "folder") and ``allow_multiple`` are bound at registration time with
+    The command name never matters here: ``kind`` ("file" or "folder") and
+    ``allow_multiple`` are bound at registration time with
     functools.partial. Registered with where_to_run="client", so it only
     fires from console input (interactive_mode), never from messages sent
     by other instances.
@@ -164,43 +145,19 @@ def _client_forward_handler(kind, allow_multiple, sock, addr, cmd):
     if not items or not addrs:
         print(
             f"{kind}: need at least one item and one destination, "
-            'e.g. /send_msg_forward "msg" "(\'127.0.0.1\', 3000)"'
+            'e.g. /file_forward "file.txt" "(\'127.0.0.1\', 3000)"'
         )
         return None
     if not allow_multiple and len(items) != 1:
         print(f"{kind}: expects exactly one item; use the multiple variant")
         return None
     relay = _RELAY_FOR_KIND[kind]
-    if kind == "send_msg":
-        _forward_request(relay, items, addrs)
-    elif kind == "file":
+    if kind == "file":
         _upload_files_sync(items)
         _forward_request(relay, [os.path.basename(p) for p in items], addrs)
     elif kind == "folder":
         _upload_folders_sync(items)
         _forward_request(relay, [os.path.basename(p) for p in items], addrs)
-    return None
-
-
-def _server_skip_message(target):
-    return f"forward: destination {target} is unreachable or is the server, skipped"
-
-
-def _forward_send_msg_handler(sock, addr, cmd):
-    """Server-side relay: push the messages to every reachable destination."""
-    if server_instance is None:
-        print("forward: server instance is not set up")
-        return None
-    parts = shlex.split(cmd)
-    items, addrs = _parse_items_and_addrs(parts[1:])
-    for target in addrs:
-        client_info = server_instance.clients.get(target)
-        if client_info is None:
-            print(_server_skip_message(target))
-            continue
-        target_socket = client_info["socket"]
-        for msg in items:
-            server_instance.send_message(target_socket, msg)
     return None
 
 
@@ -251,8 +208,9 @@ def _forward_folders_handler(sock, addr, cmd):
 
 
 def setup_client_commands(client):  # noqa: PLW0603
-    """Register the forward commands on a client instance (console use).
+    """Register the file/folder forward commands on a client instance.
 
+    Message forwarding (``/forward_send_msg``) is native and needs no setup.
     Each command binds its transfer kind and single/multiple policy into
     the shared handler via functools.partial; where_to_run="client" makes
     them fire from console input only.
@@ -260,7 +218,6 @@ def setup_client_commands(client):  # noqa: PLW0603
     global client_instance  # noqa: PLW0603
     client_instance = client
     command_specs = [
-        ("/send_msg_forward", "send_msg", True),
         ("/file_forward", "file", False),
         ("/multiple_file_forward", "file", True),
         ("/folder_forward", "folder", False),
@@ -276,8 +233,9 @@ def setup_client_commands(client):  # noqa: PLW0603
 
 
 def setup_server_commands(server):  # noqa: PLW0603
-    """Register the internal forward relays on a server instance.
+    """Register the file/folder forward relays on a server instance.
 
+    The message relay (``/forward_send_msg``) is native and needs no setup.
     These handlers are triggered by relay requests sent by clients, i.e.
     they live in the "server" group: messages coming in from other
     instances are dispatched there. The /xxx_forward commands themselves
@@ -286,9 +244,6 @@ def setup_server_commands(server):  # noqa: PLW0603
     """
     global server_instance  # noqa: PLW0603
     server_instance = server
-    server.register_command(
-        "/forward_send_msg", _forward_send_msg_handler, where_to_run="server", run_in_thread=True
-    )
     server.register_command(
         "/forward_file", _forward_files_handler, where_to_run="server", run_in_thread=True
     )

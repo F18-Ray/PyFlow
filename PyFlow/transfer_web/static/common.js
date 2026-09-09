@@ -14,7 +14,7 @@
     connected: false,
     target: null, // "server" | [ip, port]
     extensions: [], // [{name, icon, command}]
-    messages: [], // [{dir: "out"|"sys", text}]
+    conversations: {}, // targetKey -> [{dir: "in"|"out"|"sys", text}]
     eventId: 0, // last inbound event id consumed from /api/events
   };
 
@@ -52,6 +52,12 @@
     if (target === "server") {
       return "Server " + (state.serverInfo ? state.serverInfo.host + ":" + state.serverInfo.port : "");
     }
+    return target[0] + ":" + target[1];
+  }
+
+  function targetKey(target) {
+    if (target === "server") return "server";
+    if (typeof target === "string") return target; // already an "ip:port" (event sender)
     return target[0] + ":" + target[1];
   }
 
@@ -124,21 +130,19 @@
     const title = $("target-title");
     if (MODE === "server" && target === "server") {
       title.textContent = "This is the server";
-      $("empty-hint").style.display = "block";
-      $("empty-hint").textContent =
-        "This is the server. Select a connected client on the left to send data.";
       $("input").disabled = true;
       $("send-btn").disabled = true;
       $("icon-bar").style.opacity = "0.4";
       $("icon-bar").style.pointerEvents = "none";
+      renderConversation();
       return;
     }
     title.textContent = "Sending to " + targetLabel(target);
-    $("empty-hint").style.display = "none";
     $("input").disabled = false;
     $("send-btn").disabled = false;
     $("icon-bar").style.opacity = "1";
     $("icon-bar").style.pointerEvents = "auto";
+    renderConversation();
     $("input").focus();
   }
 
@@ -175,24 +179,21 @@
     } catch (e) {
       return; // offline or a backend without the endpoint
     }
-    let rendered = 0;
     (data.events || []).forEach((ev) => {
       if (ev.id) state.eventId = Math.max(state.eventId, ev.id);
       const from = ev.from ? ev.from + ": " : "";
+      // Events come from a specific peer (client-to-client forwards carry the
+      // sender's address) or, when the sender is unknown (direct pushes by the
+      // server), from the server itself.
+      const target = ev.from || "server";
       if (ev.type === "msg") {
-        addMessage("in", from + ev.text);
-        rendered++;
+        addMessage("in", from + ev.text, target);
       } else if (ev.type === "file") {
         const size = fmtSize(ev.size);
-        addMessage("in", from + "file received: " + ev.name + " (" + size + ") -> " + ev.path);
+        addMessage("in", from + "file received: " + ev.name + " (" + size + ") -> " + ev.path, target);
         toast("File received: " + ev.name + " (" + size + ")", "ok");
-        rendered++;
       }
     });
-    if (rendered && MODE === "server") {
-      const hint = $("empty-hint");
-      if (hint) hint.style.display = "none";
-    }
   }
 
   /* ---------------- sending ---------------- */
@@ -229,12 +230,39 @@
     }
   }
 
-  function addMessage(dir, text) {
+  function addMessage(dir, text, target) {
+    const key = targetKey(target || state.target);
+    if (!state.conversations[key]) state.conversations[key] = [];
+    state.conversations[key].push({ dir, text });
+    if (key === targetKey(state.target)) renderConversation();
+  }
+
+  function renderConversation() {
     const area = $("chat-area");
-    const el = document.createElement("div");
-    el.className = "msg " + dir;
-    el.textContent = text;
-    area.appendChild(el);
+    const hint = $("empty-hint");
+    const key = targetKey(state.target);
+    const msgs = state.conversations[key] || [];
+    area.querySelectorAll(".msg").forEach((el) => el.remove());
+    if (!msgs.length) {
+      hint.style.display = "block";
+      if (MODE === "server" && state.target === "server") {
+        hint.textContent =
+          "This is the server. Select a connected client on the left to send data.";
+      } else if (key === "server") {
+        hint.textContent =
+          "Connected. Select the server or a client on the left to send messages, files or folders.";
+      } else {
+        hint.textContent = "No messages with this target yet.";
+      }
+    } else {
+      hint.style.display = "none";
+    }
+    msgs.forEach((m) => {
+      const el = document.createElement("div");
+      el.className = "msg " + m.dir;
+      el.textContent = m.text;
+      area.appendChild(el);
+    });
     area.scrollTop = area.scrollHeight;
   }
 
@@ -318,6 +346,10 @@
       });
       try {
         await api("/api/" + (folderMode ? "send_folder" : "send_file"), { method: "POST", body: fd });
+        const label = folderMode
+          ? (files[0].webkitRelativePath || files[0].name).split("/")[0]
+          : files.map((f) => f.name).join(", ");
+        addMessage("out", (folderMode ? "folder sent: " : "file sent: ") + label, target);
         toast("Transfer started", "ok");
         closeModal(backdrop);
       } catch (e) {
