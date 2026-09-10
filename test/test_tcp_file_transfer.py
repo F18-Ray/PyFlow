@@ -10,7 +10,11 @@ import pytest
 
 from test_util import server_ready, wait_until
 
-from PyFlow.network_api.connect_tcp import TCP_Client_Base, TCP_Server_Base
+from PyFlow.network_api.connect_tcp import (
+    TCP_Client_Base,
+    TCP_Server_Base,
+    parse_forward_originator,
+)
 from unittest.mock import MagicMock
 
 _PORT_COUNTER = 65420
@@ -388,6 +392,62 @@ def _forward_client(server, recv_dir):
     client.file_transfer_dir = str(recv_dir)
     assert client.connect()
     return client
+
+
+def test_parse_forward_originator():
+    """The originator tuple in a pushed /file or /file_folder command is
+    recovered; a direct send (the receiver's own address) is filtered out."""
+    # the wire form produced by forward_target_command (tuple shlex-quoted)
+    cmd = lambda *a: TCP_Server_Base.forward_target_command(None, *a)
+    assert parse_forward_originator(cmd("file", "", "a.txt", ("127.0.0.1", 3000), 7)) == (
+        "127.0.0.1:3000"
+    )
+    assert parse_forward_originator(
+        cmd("file", "", "a.txt", ("127.0.0.1", 3000), 7, "dest")
+    ) == "127.0.0.1:3000"
+    assert parse_forward_originator(
+        cmd("folder", "d", "a.txt", ("127.0.0.1", 3000), 7)
+    ) == "127.0.0.1:3000"
+    assert parse_forward_originator(
+        cmd("folder", "d", "a.txt", ("127.0.0.1", 3000), 7, "dest")
+    ) == "127.0.0.1:3000"
+    # direct send: the tuple is the receiver's own address -> filtered
+    assert (
+        parse_forward_originator(
+            cmd("file", "", "a.txt", ("127.0.0.1", 3000), 7),
+            own_address="127.0.0.1:3000",
+        )
+        is None
+    )
+    # no tuple: plain direct send or a non-transfer command
+    assert parse_forward_originator("/file 'a.txt' 7") is None
+    assert parse_forward_originator("/pause_trans 3") is None
+
+
+def test_forwarded_file_carries_originator(pair, tmp_path):
+    """A streamed forward tags the pushed /file command with the originator's
+    address: the receiver's file listener can attribute the transfer."""
+    server, target, recv_dir = pair
+    src = tmp_path / "payload.bin"
+    payload = os.urandom(4096)
+    src.write_bytes(payload)
+    forwarder = _forward_client(server, tmp_path / "fwd")
+    commands = []
+    target.add_file_listener(
+        lambda full_path, name, size, command: commands.append(command)
+    )
+    t = target.client_socket.getsockname()
+    cmd = '/forward_file "{}" "({}, {})"'.format(src, repr(t[0]), t[1])
+    forwarder.forward_file_console(cmd)
+    assert wait_until(lambda: (recv_dir / "payload.bin").exists(), timeout=15), (
+        "forwarded file not received"
+    )
+    assert wait_until(lambda: len(commands) >= 1), f"no file event {commands=}"
+    a = forwarder.client_socket.getsockname()
+    own = target.client_socket.getsockname()
+    originator = parse_forward_originator(commands[0], own_address=f"{own[0]}:{own[1]}")
+    assert originator == f"{a[0]}:{a[1]}"
+    forwarder.close()
 
 
 def test_forward_file_to_multiple_clients(pair, tmp_path):

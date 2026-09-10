@@ -31,10 +31,11 @@ from test_util import server_ready, wait_until
 from PyFlow.network_api.connect_tcp import (
     TCP_Client_Base,
     TCP_Server_Base,
+    parse_forward_originator,
     parse_forwarded_message,
 )
 
-_PORT_COUNTER = 65530
+_PORT_COUNTER = 65500
 
 
 def _next_port():
@@ -212,6 +213,21 @@ def test_forward_records_keyed_by_originator(trio):
     assert all(
         e[0] != "rec me" for e in b.messages_dict.get(b.client_socket, [])
     )
+
+
+def test_public_forward_api(trio):
+    """The packaged forward API for extension authors: forward_message_to
+    tags the envelope, forward_target_command builds the tagged transfer
+    command, and unreachable targets are reported."""
+    server, a, b = trio
+    received = []
+    b.add_message_listener(lambda sender, text: received.append((sender, text)))
+    assert server.forward_message_to(_addr(b), "via api", _addr(a))
+    assert wait_until(lambda: len(received) == 1), f"never arrived {received=}"
+    assert received[0] == (_client_key(a), "via api")
+    cmd = server.forward_target_command("file", "", "a.txt", _addr(a), 7)
+    assert parse_forward_originator(cmd) == _client_key(a)
+    assert server.forward_message_to(("127.0.0.1", 1), "x", _addr(a)) is False  # unreachable
 
 
 def test_extension_command_cannot_hijack_envelope(trio):

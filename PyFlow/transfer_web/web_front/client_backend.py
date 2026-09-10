@@ -39,7 +39,7 @@ from flask import Flask, jsonify, render_template, request
 
 from PyFlow import add_extension
 from PyFlow import forward_extension_tcp
-from PyFlow.network_api.connect_tcp import TCP_Client_Base
+from PyFlow.network_api.connect_tcp import TCP_Client_Base, parse_forward_originator
 
 WEB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLOW_WEB_DIR = os.path.join(WEB_ROOT, ".Flow_Web")
@@ -246,15 +246,21 @@ class ClientWebApp:
                     rel = candidate
             except Exception:
                 pass
-        self._push_event(
-            {
-                "type": "file",
-                "name": name,
-                "path": rel,
-                "size": size,
-                "at": time.strftime("%H:%M:%S"),
-            }
-        )
+        event = {
+            "type": "file",
+            "name": name,
+            "path": rel,
+            "size": size,
+            "at": time.strftime("%H:%M:%S"),
+        }
+        # A forwarded file/folder carries the originator's address in the wire
+        # command; direct pushes carry the receiver's own address and are
+        # filtered out, so they keep surfacing under the server entry.
+        own = self._own_address()
+        originator = parse_forward_originator(command, own_address=own["id"] if own else None)
+        if originator:
+            event["from"] = originator
+        self._push_event(event)
 
     # ---------------------------------------------------------------- connect
 

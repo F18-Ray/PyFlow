@@ -128,6 +128,35 @@ def forward_skip_message(target):
     return f"forward: destination {target} is unreachable or is the server, skipped"
 
 
+def parse_forward_originator(command, own_address=None):
+    """Extract the originator's ``"ip:port"`` from a received transfer command.
+    The server's forward relay tags every pushed ``/file`` and ``/file_folder``
+    command with the forwarding client's address tuple (the tuple token before
+    the trailing transfer id). Direct sends carry the receiver's own address
+    instead, which is filtered out when ``own_address`` is given. Returns the
+    originator's ``"ip:port"``, or ``None`` when the command carries no
+    originator (a direct send or a non-transfer command).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if len(parts) < 4:
+        return None
+    for token in parts[1:-1]:  # skip the command name and the trailing id
+        if token.startswith("(") and token.endswith(")"):
+            try:
+                addr = ast.literal_eval(token)
+            except (ValueError, SyntaxError):
+                continue
+            if isinstance(addr, tuple) and len(addr) == 2 and isinstance(addr[0], str):
+                originator = f"{addr[0]}:{addr[1]}"
+                if own_address and originator == own_address:
+                    return None  # direct send: the tuple is the receiver itself
+                return originator
+    return None
+
+
 class TCP_Server_Base:  # TCP server class
     def __init__(
         self,
@@ -1414,21 +1443,80 @@ class TCP_Server_Base:  # TCP server class
         items, addrs = parse_forward_items_and_addrs(parts[1:])
         reached = False
         for target in addrs:
-            client_info = self.clients.get(target)
-            if client_info is None:
-                print(forward_skip_message(target))
-                continue
-            reached = True
-            target_socket = client_info["socket"]
             for msg in items:
-                self.send_message(
-                    target_socket,
-                    f"/send_msg_from {shlex.quote(repr(addr))} {shlex.quote(msg)}",
-                )
+                if self.forward_message_to(target, msg, addr):
+                    reached = True
         if reached:
             for msg in items:
                 self._record_message(sock, msg)
         return None
+
+    def forward_message_to(self, target, message, originator_addr):
+        """Send one plain message to ``target``, tagged with the originator's
+        address (public API for forward extensions).
+
+        The message is wrapped in a ``/send_msg_from <addr> <payload>``
+        envelope so the receiver can attribute it to the originator (see
+        ``parse_forwarded_message`` on the receiving side). Returns False when
+        the target is not connected.
+        """
+        client_info = self.clients.get(target)
+        if client_info is None:
+            print(forward_skip_message(target))
+            return False
+        self.send_message(
+            client_info["socket"],
+            f"/send_msg_from {shlex.quote(repr(originator_addr))} {shlex.quote(message)}",
+        )
+        return True
+
+    def forward_target_command(
+        self, kind, rel_dir, fname, originator_addr, tfid, destination_path=None
+    ):
+        """Build the wire command that pushes one forwarded file/folder item to
+        a target, tagged with the originator's address (public API for forward
+        extensions).
+
+        The originator tuple sits before the trailing transfer id: the
+        receiver's existing parsers treat it as the address slot and ignore
+        it, while ``parse_forward_originator`` recovers it for attribution.
+        """
+        originator = shlex.quote(repr(originator_addr))
+        if kind == "file":
+            if destination_path:
+                return (
+                    f"/file {shlex.quote(fname)} {originator} "
+                    f"{shlex.quote(destination_path)} {tfid}"
+                )
+            return f"/file {shlex.quote(fname)} {originator} {tfid}"
+        if destination_path:
+            return (
+                f"/file_folder {shlex.quote(rel_dir)} {shlex.quote(fname)} "
+                f"{originator} {shlex.quote(destination_path)} {tfid}"
+            )
+        return f"/file_folder {shlex.quote(rel_dir)} {shlex.quote(fname)} {originator} {tfid}"
+
+    def forward_item_to(
+        self, target, kind, rel_dir, fname, originator_addr, tfid, destination_path=None
+    ):
+        """Push one forwarded file/folder item to ``target``, tagged with the
+        originator's address (public API for forward extensions).
+
+        Sends the command built by ``forward_target_command``; the receiver
+        recovers the originator with ``parse_forward_originator``. Returns
+        False when the target is not connected.
+        """
+        client_info = self.clients.get(target)
+        if client_info is None:
+            print(forward_skip_message(target))
+            return False
+        self.send_message(
+            client_info["socket"],
+            self.forward_target_command(
+                kind, rel_dir, fname, originator_addr, tfid, destination_path
+            ),
+        )
+        return True
 
     def _execute_custom_handler(self, handler, command, client_socket=None, client_address=None):
         try:
@@ -2244,7 +2332,7 @@ class TCP_Server_Base:  # TCP server class
             return
         threading.Thread(
             target=self._forward_relay,
-            args=(sock, kind, rel_dir, fname, valid_targets, destination_path),
+            args=(sock, addr, kind, rel_dir, fname, valid_targets, destination_path),
             daemon=True,
         ).start()
 
@@ -2304,9 +2392,15 @@ class TCP_Server_Base:  # TCP server class
                 relay["writer_pause"][client_address] = False
                 relay["cond"].notify_all()
 
-    def _forward_relay(self, forwarder_sock, kind, rel_dir, fname, targets, destination_path=None):
+    def _forward_relay(
+        self, forwarder_sock, originator_addr, kind, rel_dir, fname, targets, destination_path=None
+    ):
         """Relay one file/folder item to every target, streaming from the
-        uploader's transfer connection with bounded in-memory buffering."""
+        uploader's transfer connection with bounded in-memory buffering.
+
+        Every pushed command is tagged with the originator's address (see
+        ``forward_item_to``) so the receivers can attribute the transfer.
+        """
         fid = self._forward_alloc_fid()
         tfids = [self._forward_alloc_fid() for _ in targets]
         relay = {
@@ -2321,30 +2415,9 @@ class TCP_Server_Base:  # TCP server class
             # destination directory (if any) goes before the target id so
             # the receiver's own destination parsing sees it
             for target, tfid in zip(targets, tfids):
-                try:
-                    t_sock = self.clients[target]["socket"]
-                except Exception as e:
-                    print(f"forward: target {target} missing, skipped: {e}")
-                    continue
-                if kind == "file":
-                    if destination_path:
-                        self.send_message(
-                            t_sock, f"/file {shlex.quote(fname)} {shlex.quote(destination_path)} {tfid}"
-                        )
-                    else:
-                        self.send_message(t_sock, f"/file {shlex.quote(fname)} {tfid}")
-                else:
-                    if destination_path:
-                        self.send_message(
-                            t_sock,
-                            f"/file_folder {shlex.quote(rel_dir)} {shlex.quote(fname)} "
-                            f"{shlex.quote(destination_path)} {tfid}",
-                        )
-                    else:
-                        self.send_message(
-                            t_sock,
-                            f"/file_folder {shlex.quote(rel_dir)} {shlex.quote(fname)} {tfid}",
-                        )
+                self.forward_item_to(
+                    target, kind, rel_dir, fname, originator_addr, tfid, destination_path
+                )
             # collect every target's advertised transfer port
             ports = {}
             deadline = time.time() + 20
