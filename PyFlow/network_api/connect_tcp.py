@@ -246,6 +246,8 @@ class TCP_Server_Base:  # TCP server class
         self.events_dict = {}
         self._messages_dict_lock = threading.Lock()
         self._events_dict_lock = threading.Lock()
+        self._socket_keys = {}  # record key -> "ip:port", captured while it was alive
+        self._socket_keys_lock = threading.Lock()
         self._messages_dict_size = 0
         self._events_dict_size = 0
         self.max_dict_size = 64 * 1024
@@ -526,12 +528,42 @@ class TCP_Server_Base:  # TCP server class
                 traceback.print_exc()
 
     def _socket_key(self, sock):
-        """Serializable key for a sender socket (its peer address)."""
+        """Serializable key for a sender socket (its peer address).
+
+        Forwarded records already carry the originator's address as a
+        string and are used as-is; a socket that cannot answer
+        ``getpeername`` (already closed) falls back to its repr.
+        """
+        if isinstance(sock, str):
+            return sock
         try:
             ip, port = sock.getpeername()[:2]
             return f"{ip}:{port}"
         except Exception:
             return str(sock)
+
+    def _remember_socket_key(self, sock):
+        """Capture the log key of ``sock`` while it is known to be alive.
+
+        A record stays buffered after its connection goes away, and the
+        flush that persists it must still file it under the sender's
+        address: by then the closed socket no longer answers
+        ``getpeername`` and would be logged as ``str(sock)``. The key is
+        forgotten once nothing is buffered under it any more (see
+        ``_flush_dict_locked``).
+        """
+        with self._socket_keys_lock:
+            if sock not in self._socket_keys:
+                self._socket_keys[sock] = self._socket_key(sock)
+
+    def _record_key(self, sock):
+        """The JSON-log key for ``sock``: the address captured when it was
+        recorded, or the live peer address for a socket inserted without a
+        record."""
+        key = self._socket_keys.get(sock)
+        if key is not None:
+            return key
+        return self._socket_key(sock)
 
     def _record_message(self, sock, content):
         """Store one inbound plain-text message under the sender's socket.
@@ -542,6 +574,7 @@ class TCP_Server_Base:  # TCP server class
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._messages_dict_lock:
+            self._remember_socket_key(sock)
             self.messages_dict.setdefault(sock, []).append([content, timestamp])
             self._messages_dict_size += len(content.encode("utf-8", "replace")) + len(timestamp)
             if self._messages_dict_size >= self.max_dict_size:
@@ -560,6 +593,7 @@ class TCP_Server_Base:  # TCP server class
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._events_dict_lock:
+            self._remember_socket_key(sock)
             self.events_dict.setdefault(sock, []).append([command, timestamp])
             self._events_dict_size += len(command.encode("utf-8", "replace")) + len(timestamp)
             if self._events_dict_size >= self.max_dict_size:
@@ -613,6 +647,11 @@ class TCP_Server_Base:  # TCP server class
         d.clear()
         setattr(self, size_attr, 0)
         self._merge_json_log(path, snapshot)
+        other = self.events_dict if d is self.messages_dict else self.messages_dict
+        with self._socket_keys_lock:  # a key is only kept while it is buffered
+            for sock in snapshot:
+                if sock not in d and sock not in other:
+                    self._socket_keys.pop(sock, None)
 
     def _flush_messages_dict(self):
         with self._messages_dict_lock:
@@ -639,7 +678,7 @@ class TCP_Server_Base:  # TCP server class
             else:
                 existing = {}
             for sock, entries in snapshot.items():
-                key = self._socket_key(sock)
+                key = self._record_key(sock)
                 existing.setdefault(key, []).extend(entries)
             tmp_path = path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2822,6 +2861,8 @@ class TCP_Client_Base:  # TCP client class
         self.events_dict = {}
         self._messages_dict_lock = threading.Lock()
         self._events_dict_lock = threading.Lock()
+        self._socket_keys = {}  # record key -> "ip:port", captured while it was alive
+        self._socket_keys_lock = threading.Lock()
         self._messages_dict_size = 0
         self._events_dict_size = 0
         self.max_dict_size = 64 * 1024
@@ -2939,12 +2980,42 @@ class TCP_Client_Base:  # TCP client class
                 traceback.print_exc()
 
     def _socket_key(self, sock):
-        """Serializable key for a sender socket (its peer address)."""
+        """Serializable key for a sender socket (its peer address).
+
+        Forwarded records already carry the originator's address as a
+        string and are used as-is; a socket that cannot answer
+        ``getpeername`` (already closed) falls back to its repr.
+        """
+        if isinstance(sock, str):
+            return sock
         try:
             ip, port = sock.getpeername()[:2]
             return f"{ip}:{port}"
         except Exception:
             return str(sock)
+
+    def _remember_socket_key(self, sock):
+        """Capture the log key of ``sock`` while it is known to be alive.
+
+        A record stays buffered after its connection goes away, and the
+        flush that persists it must still file it under the sender's
+        address: by then the closed socket no longer answers
+        ``getpeername`` and would be logged as ``str(sock)``. The key is
+        forgotten once nothing is buffered under it any more (see
+        ``_flush_dict_locked``).
+        """
+        with self._socket_keys_lock:
+            if sock not in self._socket_keys:
+                self._socket_keys[sock] = self._socket_key(sock)
+
+    def _record_key(self, sock):
+        """The JSON-log key for ``sock``: the address captured when it was
+        recorded, or the live peer address for a socket inserted without a
+        record."""
+        key = self._socket_keys.get(sock)
+        if key is not None:
+            return key
+        return self._socket_key(sock)
 
     def _record_message(self, sock, content):
         """Store one inbound plain-text message under the sender's socket.
@@ -2955,6 +3026,7 @@ class TCP_Client_Base:  # TCP client class
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._messages_dict_lock:
+            self._remember_socket_key(sock)
             self.messages_dict.setdefault(sock, []).append([content, timestamp])
             self._messages_dict_size += len(content.encode("utf-8", "replace")) + len(timestamp)
             if self._messages_dict_size >= self.max_dict_size:
@@ -2973,6 +3045,7 @@ class TCP_Client_Base:  # TCP client class
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._events_dict_lock:
+            self._remember_socket_key(sock)
             self.events_dict.setdefault(sock, []).append([command, timestamp])
             self._events_dict_size += len(command.encode("utf-8", "replace")) + len(timestamp)
             if self._events_dict_size >= self.max_dict_size:
@@ -3026,6 +3099,11 @@ class TCP_Client_Base:  # TCP client class
         d.clear()
         setattr(self, size_attr, 0)
         self._merge_json_log(path, snapshot)
+        other = self.events_dict if d is self.messages_dict else self.messages_dict
+        with self._socket_keys_lock:  # a key is only kept while it is buffered
+            for sock in snapshot:
+                if sock not in d and sock not in other:
+                    self._socket_keys.pop(sock, None)
 
     def _flush_messages_dict(self):
         with self._messages_dict_lock:
@@ -3052,7 +3130,7 @@ class TCP_Client_Base:  # TCP client class
             else:
                 existing = {}
             for sock, entries in snapshot.items():
-                key = self._socket_key(sock)
+                key = self._record_key(sock)
                 existing.setdefault(key, []).extend(entries)
             tmp_path = path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:

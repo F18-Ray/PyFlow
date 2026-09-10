@@ -193,11 +193,31 @@ def test_flush_on_close_persists_remaining(pair, tmp_path):
             for e in server.messages_dict.get(_server_sock(server, client), [])
         )
     ), "message not recorded"
+    key = _client_addr_key(client)  # the live socket's address, before stop()
     server.stop()
     with open(server.messages_log_file, "r", encoding="utf-8") as f:
         data = json.load(f)
+    assert any(e[0] == "persist me" for e in data.get(key, [])), (
+        f"no entry under {key}; log keys: {list(data)}"
+    )
+
+
+def test_flush_keeps_sender_key_after_connection_closed(pair):
+    """A record buffered when its connection goes away is still flushed under
+    the sender's address, not under a dead socket repr."""
+    server, client = pair
+    server_sock = _server_sock(server, client)
     key = _client_addr_key(client)
-    assert any(e[0] == "persist me" for e in data.get(key, []))
+    server._record_message(server_sock, "persist me")
+    server_sock.close()  # the connection is gone before the store is flushed
+    server._flush_messages_dict()
+    with open(server.messages_log_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert any(e[0] == "persist me" for e in data.get(key, [])), (
+        f"no entry under {key}; log keys: {list(data)}"
+    )
+    server._flush_events_dict()  # nothing buffered under the socket any more
+    assert server_sock not in server._socket_keys
 
 
 def test_splice_event_command(pair):
