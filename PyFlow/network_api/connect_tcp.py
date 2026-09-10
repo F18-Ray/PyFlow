@@ -1212,7 +1212,14 @@ class TCP_Server_Base:  # TCP server class
                 print(f"error while welcoming client {client_id} : {e}")
             return
         # announce our encryption mode; a mismatched peer is disconnected in handle_command
-        self._send_raw(client_socket, f"/crypto_mode {1 if self.is_enable_encrypto else 0}")
+        try:
+            self._send_raw(client_socket, f"/crypto_mode {1 if self.is_enable_encrypto else 0}")
+        except Exception as e:
+            # the peer vanished right after the welcome: the finally block
+            # below cleans up; never let this escape the thread
+            if not _is_closed_socket_error(e):
+                print(f"error while announcing crypto mode to {client_id} : {e}")
+            return
         if self.is_hand_alloc_port == True:
             broadcast_clients_port_alloc_range_msg = "/client_alloc_port_range {}".format(
                 self.each_client_port_range
@@ -1678,9 +1685,8 @@ class TCP_Server_Base:  # TCP server class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError(
                             "ErrorWhileReceivingFileNameLength: client disconnected"
@@ -1700,9 +1706,8 @@ class TCP_Server_Base:  # TCP server class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError("ErrorWhileReceivingFileName: client disconnected")
                     file_name_encoded += chunk
@@ -1720,9 +1725,8 @@ class TCP_Server_Base:  # TCP server class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError("ErrorWhileReceivingFileSize: client disconnected")
                     size_bytes += chunk
@@ -1796,9 +1800,8 @@ class TCP_Server_Base:  # TCP server class
                         pass
                 try:
                     self.send_message(client_file_socket, self.error_sign)
-                except:
-                    traceback.print_exc()
-                    pass
+                except Exception:
+                    pass  # send_message already logged real errors; a dead peer is expected
                 close_socket()
                 print(f"ErrorWhileReceiveFile: {e}")
                 return False
@@ -2170,9 +2173,8 @@ class TCP_Server_Base:  # TCP server class
                         print("\nbreak the file transfer connection from server")
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         break
                     file_receive_data_from_server = data.decode("utf-8").strip()
@@ -2182,12 +2184,12 @@ class TCP_Server_Base:  # TCP server class
                         break
                 except Exception as e:
                     print(f"\nget file transfer msg error: {e}")
-                    traceback.print_exc()
+                    if not _is_closed_socket_error(e):
+                        traceback.print_exc()
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     close_socket()
                     break
 
@@ -2210,9 +2212,8 @@ class TCP_Server_Base:  # TCP server class
                 if waiting_time >= 10:
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     print(
                         f"ErrorWhileSendFile: \
                           Wait file transfer function start sign timeout, \
@@ -2254,9 +2255,8 @@ class TCP_Server_Base:  # TCP server class
                 if waiting_time >= timeout:
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     close_socket()
                     print(
                         f"ErrorWhileSendFileData: \
@@ -2271,19 +2271,18 @@ class TCP_Server_Base:  # TCP server class
             traceback.print_exc()
             try:
                 self.send_message(client_file_socket, self.error_sign)
-            except:
-                traceback.print_exc()
-                pass
+            except Exception:
+                pass  # send_message already logged real errors; a dead peer is expected
             close_socket()
             print(f"file {filename} not exist")
             return False
         except Exception as e:
-            traceback.print_exc()
+            if not _is_closed_socket_error(e):
+                traceback.print_exc()
             try:
                 self.send_message(client_file_socket, self.error_sign)
-            except:
-                traceback.print_exc()
-                pass
+            except Exception:
+                pass  # send_message already logged real errors; a dead peer is expected
             close_socket()
             print(f"send error: {e}")
             return False
@@ -4381,9 +4380,8 @@ class TCP_Client_Base:  # TCP client class
                         print("\nbreak the file transfer connection from server")
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         break
                     file_receive_data_from_server = data.decode("utf-8").strip()
@@ -4393,12 +4391,12 @@ class TCP_Client_Base:  # TCP client class
                         break
                 except Exception as e:
                     print(f"\nget file transfer msg error: {e}")
-                    traceback.print_exc()
+                    if not _is_closed_socket_error(e):
+                        traceback.print_exc()
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     close_socket()
                     break
 
@@ -4421,9 +4419,8 @@ class TCP_Client_Base:  # TCP client class
                 if waiting_time >= 10:
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     print(
                         f"ErrorWhileSendFile: \
                           Wait file transfer function start sign timeout, \
@@ -4465,9 +4462,8 @@ class TCP_Client_Base:  # TCP client class
                 if waiting_time >= timeout:
                     try:
                         self.send_message(client_file_socket, self.error_sign)
-                    except:
-                        traceback.print_exc()
-                        pass
+                    except Exception:
+                        pass  # send_message already logged real errors; a dead peer is expected
                     close_socket()
                     print(
                         f"ErrorWhileSendFileData: \
@@ -4482,19 +4478,18 @@ class TCP_Client_Base:  # TCP client class
             traceback.print_exc()
             try:
                 self.send_message(client_file_socket, self.error_sign)
-            except:
-                traceback.print_exc()
-                pass
+            except Exception:
+                pass  # send_message already logged real errors; a dead peer is expected
             close_socket()
             print(f"file {filename} not exist")
             return False
         except Exception as e:
-            traceback.print_exc()
+            if not _is_closed_socket_error(e):
+                traceback.print_exc()
             try:
                 self.send_message(client_file_socket, self.error_sign)
-            except:
-                traceback.print_exc()
-                pass
+            except Exception:
+                pass  # send_message already logged real errors; a dead peer is expected
             close_socket()
             print(f"send error: {e}")
             return False
@@ -4739,9 +4734,8 @@ class TCP_Client_Base:  # TCP client class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError(
                             "ErrorWhileReceivingFileNameLength: client disconnected"
@@ -4761,9 +4755,8 @@ class TCP_Client_Base:  # TCP client class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError("ErrorWhileReceivingFileName: client disconnected")
                     file_name_encoded += chunk
@@ -4781,9 +4774,8 @@ class TCP_Client_Base:  # TCP client class
                     if not chunk:
                         try:
                             self.send_message(client_file_socket, self.error_sign)
-                        except:
-                            traceback.print_exc()
-                            pass
+                        except Exception:
+                            pass  # send_message already logged real errors; a dead peer is expected
                         close_socket()
                         raise ConnectionError("ErrorWhileReceivingFileSize: client disconnected")
                     size_bytes += chunk
@@ -4847,9 +4839,8 @@ class TCP_Client_Base:  # TCP client class
                         pass
                 try:
                     self.send_message(client_file_socket, self.error_sign)
-                except:
-                    traceback.print_exc()
-                    pass
+                except Exception:
+                    pass  # send_message already logged real errors; a dead peer is expected
                 close_socket()
                 print(f"ErrorWhileReceiveFile: {e}")
                 return False
