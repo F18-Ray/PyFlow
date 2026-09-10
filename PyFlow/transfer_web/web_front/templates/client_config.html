@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PyFlow TCP Server Setup</title>
+  <title>PyFlow TCP Client Setup</title>
   <link rel="stylesheet" href="/static/common.css">
 </head>
 <body>
   <div class="center-wrap">
     <div class="card">
-      <h1>PyFlow TCP Server Setup</h1>
-      <p class="subtitle">Configure the TCP server. Every parameter has a default value; change only what you need.</p>
+      <h1>PyFlow TCP Client Setup</h1>
+      <p class="subtitle">Configure the TCP client. Every parameter has a default value; change only what you need.</p>
       <form id="config-form" class="form-grid">
         {% for key, label, ftype, default, help in fields %}
         <div class="field">
@@ -28,16 +28,8 @@
           {% endif %}
         </div>
         {% endfor %}
-        {% for key, label, ftype, default, help in web_fields %}
-        <div class="field">
-          <label for="f-{{ key }}">{{ label }}</label>
-          <input type="{{ ftype }}" id="f-{{ key }}" data-key="{{ key }}" data-type="{{ ftype }}"
-                 value="{{ default }}" {% if ftype == "number" %}step="any"{% endif %}>
-          <div class="help">{{ help }}</div>
-        </div>
-        {% endfor %}
         <div class="actions full">
-          <button type="submit" class="btn" id="save-btn">Save &amp; Start Server</button>
+          <button type="submit" class="btn" id="save-btn">Save &amp; Restart Client</button>
           <span class="status-line" id="status"></span>
         </div>
       </form>
@@ -77,10 +69,9 @@
       e.preventDefault();
       saveBtn.disabled = true;
       status.className = "status-line";
-      status.textContent = "Saving configuration and starting the TCP server...";
+      status.textContent = "Saving configuration and restarting the TCP client...";
       const oldPid = await currentPid();
       const params = {};
-      let webPort = 5000;
       form.querySelectorAll("[data-key]").forEach((el) => {
         const key = el.dataset.key;
         const type = el.dataset.type;
@@ -92,17 +83,13 @@
         } else {
           value = el.value;
         }
-        if (key === "web_port") {
-          webPort = Number(el.value) || 5000;
-        } else {
-          params[key] = value;
-        }
+        params[key] = value;
       });
       try {
         const resp = await fetch("/api/save_config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ params, web_port: webPort }),
+          body: JSON.stringify({ params }),
         });
         const data = await resp.json();
         if (!resp.ok || !data.ok) {
@@ -118,8 +105,8 @@
           return;
         }
         status.className = "status-line ok";
-        status.textContent = "TCP server started at " + data.server_info.host + ":" + data.server_info.port;
-        setTimeout(() => { location.href = "/"; }, 1200);
+        status.textContent = "Configuration saved, reconnecting...";
+        setTimeout(() => { location.href = "/"; }, 800);
       } catch (err) {
         status.className = "status-line err";
         status.textContent = "Failed: " + err.message;

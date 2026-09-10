@@ -21,6 +21,7 @@ from transfer_web.web_front.client_backend import ClientWebApp  # noqa: E402
 
 def main():
     app = ClientWebApp()
+    app.start_from_config()
     app.run()
 
 

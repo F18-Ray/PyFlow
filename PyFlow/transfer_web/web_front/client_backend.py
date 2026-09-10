@@ -28,6 +28,7 @@ import json
 import os
 import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -45,12 +46,50 @@ WEB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLOW_WEB_DIR = os.path.join(WEB_ROOT, ".Flow_Web")
 CLIENT_EXTENSIONS_UI_FILE = os.path.join(FLOW_WEB_DIR, "client_extensions_ui.json")
 CLIENT_LAST_SERVER_FILE = os.path.join(FLOW_WEB_DIR, "client_last_server.json")
+CLIENT_CONFIG_FILE = os.path.join(FLOW_WEB_DIR, "setup_client.json")
 UPLOAD_DIR = os.path.join(FLOW_WEB_DIR, "uploads")
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 STATIC_DIR = os.path.join(WEB_ROOT, "static")
 
 DEFAULT_CLIENT_WEB_PORT = 5001
 DEFAULT_SERVER_WEB_PORT = 5000
+
+# Ordered (key, label, type, default, help) for every TCP_Client_Base
+# parameter shown in the startup-configuration UI.
+CLIENT_PARAM_FIELDS = [
+    ("host", "Server host", "text", "", "TCP server IP/host the client connects to."),
+    ("port", "Server port", "number", 65432, "TCP port of the server."),
+    ("client_host", "Client host", "text", "127.0.0.1", "Local address the client binds to."),
+    ("client_port", "Client port", "number", "", "Local port (empty = auto-allocated)."),
+    ("timeout", "Timeout (s)", "number", "", "Connection timeout in seconds (empty = none)."),
+    ("port_add_step", "Port add step", "number", 1, "Step size for port allocation."),
+    ("max_thread_num", "Max threads", "number", 10, "Maximum concurrent transfer threads."),
+    (
+        "is_input_command_in_console",
+        "Console input",
+        "bool",
+        False,
+        "Forced False by the web architecture (the web UI is the input).",
+    ),
+    (
+        "is_wait_server",
+        "Wait for server",
+        "bool",
+        True,
+        "Wait for the server to be reachable before starting.",
+    ),
+    ("max_custom_workers", "Max custom workers", "number", 10, "Maximum custom-command worker threads."),
+    (
+        "is_extend_command",
+        "Extend command",
+        "bool",
+        True,
+        "Forced True by the web architecture (extensions are registered before start).",
+    ),
+    ("is_enable_encrypto", "Enable encryption", "bool", True, "RSA-encrypt the TCP channel."),
+    ("is_custom_keys", "Custom keys", "text", "", "Optional [pub_key_path, pvt_key_path] pair."),
+    ("max_mem_buff", "Max memory buffer (MB)", "number", 2048, "In-memory transfer buffer in MB."),
+]
 
 
 def _find_free_port(base):
@@ -88,6 +127,15 @@ def _load_json_list(path):
         except Exception:
             return []
     return []
+
+
+def _config_display_value(key, value):
+    """Render a saved config value for the config form input."""
+    if value is None:
+        return ""
+    if key == "is_custom_keys" and isinstance(value, list):
+        return json.dumps(value)
+    return value
 
 
 class ClientWebApp:
@@ -177,7 +225,20 @@ class ClientWebApp:
 
     def _restart(self):
         time.sleep(1)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Spawn a fresh process and exit: ``os.execv`` would keep the Flask
+        # dev-server socket (no FD_CLOEXEC) alive and strand the old web port.
+        try:
+            subprocess.Popen(
+                [sys.executable] + sys.argv,
+                close_fds=True,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            traceback.print_exc()
+        os._exit(0)
 
     def _on_clients_update(self, sock, addr, cmd):
         """Server broadcast: refresh the sidebar instance list."""
@@ -265,22 +326,55 @@ class ClientWebApp:
     # ---------------------------------------------------------------- connect
 
     def _start_client(self, host, port, is_enable_encrypto):
-        self.client = TCP_Client_Base(
-            host=host,
-            port=port,
-            client_host="127.0.0.1",
-            client_port=None,
-            timeout=None,
-            port_add_step=1,
-            max_thread_num=10,
-            is_input_command_in_console=False,
-            is_wait_server=True,
-            max_custom_workers=10,
-            is_extend_command=True,
-            is_enable_encrypto=is_enable_encrypto,
-            is_custom_keys=None,
-            max_mem_buff=2048,
-        )
+        params = self._load_client_params()
+        params["host"] = host
+        params["port"] = port
+        params["is_enable_encrypto"] = is_enable_encrypto
+        self._start_client_from_params(params)
+
+    def _load_client_params(self):
+        """Return the saved client startup params (``setup_client.json``), if any."""
+        if os.path.exists(CLIENT_CONFIG_FILE):
+            try:
+                with open(CLIENT_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def start_from_config(self):
+        """Read ``.Flow_Web/setup_client.json`` and start the TCP client."""
+        params = self._load_client_params()
+        if not params:
+            return
+        self._start_client_from_params(params)
+
+    def _normalize_client_params(self, params):
+        """Normalize form values into TCP_Client_Base constructor arguments."""
+        params = dict(params)
+        # Web architecture constraints: extensions must be registered
+        # before start, and the web UI replaces the console input.
+        params["is_extend_command"] = True
+        params["is_input_command_in_console"] = False
+        if params.get("client_port") in (None, ""):
+            params["client_port"] = None
+        if params.get("timeout") in (None, ""):
+            params["timeout"] = None
+        if params.get("is_custom_keys") in (None, ""):
+            params["is_custom_keys"] = None
+        elif isinstance(params["is_custom_keys"], str):
+            try:
+                parsed = json.loads(params["is_custom_keys"])
+                params["is_custom_keys"] = parsed if isinstance(parsed, list) else None
+            except Exception:
+                params["is_custom_keys"] = None
+        return params
+
+    def _start_client_from_params(self, params):
+        """Create, register and start the TCP_Client_Base instance."""
+        params = self._normalize_client_params(params)
+        self.client = TCP_Client_Base(**params)
         forward_extension_tcp.setup_client_commands(self.client)
         self.client.register_command(
             "/web_clients_update", self._on_clients_update, where_to_run="server", run_in_thread=True
@@ -294,9 +388,9 @@ class ClientWebApp:
         threading.Thread(target=self.client.start_TCP_client, daemon=True).start()
         self.connected = True
         self.server_info = {
-            "host": host,
-            "port": port,
-            "is_enable_encrypto": is_enable_encrypto,
+            "host": params["host"],
+            "port": params["port"],
+            "is_enable_encrypto": params.get("is_enable_encrypto", True),
         }
         with self._clients_lock:
             self._clients = []
@@ -321,6 +415,33 @@ class ClientWebApp:
                 except Exception:
                     last = ""
             return render_template("client_connect.html", last_address=last)
+
+        @app.get("/config")
+        def config():
+            """Startup-configuration page, reachable from the main page too."""
+            current = self._load_client_params()
+            if not current and self.client is not None:
+                c = self.client
+                current = {
+                    "host": c.host,
+                    "port": c.port,
+                    "client_host": c.client_host,
+                    "client_port": c.client_port,
+                    "timeout": c.timeout,
+                    "port_add_step": c.port_add_step,
+                    "max_thread_num": c.max_thread_num,
+                    "is_input_command_in_console": c.is_input_command_in_console,
+                    "is_wait_server": c.is_wait_server,
+                    "is_extend_command": c.is_extend_command,
+                    "is_enable_encrypto": c.is_enable_encrypto,
+                    "is_custom_keys": c.is_custom_keys,
+                    "max_mem_buff": c.max_mem_buff // (1024 * 1024),
+                }
+            fields = [
+                (key, label, ftype, _config_display_value(key, current.get(key, default)), help)
+                for key, label, ftype, default, help in CLIENT_PARAM_FIELDS
+            ]
+            return render_template("client_config.html", fields=fields)
 
         @app.post("/api/connect")
         def api_connect():
@@ -356,6 +477,32 @@ class ClientWebApp:
                 return jsonify({"ok": False, "error": f"failed to start TCP client: {e}"}), 500
             return jsonify({"ok": True, "server_info": self.server_info})
 
+        @app.post("/api/save_config")
+        def api_save_config():
+            data = request.get_json(force=True)
+            params = data.get("params", {})
+            # Validate the params by constructing the client class before saving.
+            try:
+                TCP_Client_Base(**self._normalize_client_params(params))
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"invalid configuration: {e}"}), 400
+            os.makedirs(FLOW_WEB_DIR, exist_ok=True)
+            with open(CLIENT_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(params, f, indent=4, ensure_ascii=False)
+            # Restart the TCP client in place; the Flask app stays up, so
+            # there is no dead window and no dependency on process spawning.
+            if self.client is not None:
+                try:
+                    self.client.close()
+                except Exception:
+                    traceback.print_exc()
+            try:
+                self._start_client_from_params(params)
+            except Exception as e:
+                traceback.print_exc()
+                return jsonify({"ok": False, "error": f"failed to start TCP client: {e}"}), 500
+            return jsonify({"ok": True, "server_info": self.server_info})
+
         @app.get("/api/status")
         def api_status():
             return jsonify(
@@ -366,6 +513,7 @@ class ClientWebApp:
                     "server_info": self.server_info,
                     "clients": self._clients_snapshot(),
                     "own_address": self._own_address(),
+                    "pid": os.getpid(),
                 }
             )
 

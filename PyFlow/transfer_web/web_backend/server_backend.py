@@ -27,6 +27,7 @@ import json
 import os
 import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -127,6 +128,15 @@ def _load_json_list(path):
         except Exception:
             return []
     return []
+
+
+def _config_display_value(key, value):
+    """Render a saved config value for the config form input."""
+    if value is None:
+        return ""
+    if key == "is_custom_keys" and isinstance(value, list):
+        return json.dumps(value)
+    return value
 
 
 class ServerWebApp:
@@ -340,7 +350,35 @@ class ServerWebApp:
 
     def _restart(self):
         time.sleep(1)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Spawn a fresh process and exit: ``os.execv`` would keep the Flask
+        # dev-server socket (no FD_CLOEXEC) alive and strand the old web port.
+        try:
+            subprocess.Popen(
+                [sys.executable] + sys.argv,
+                close_fds=True,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            traceback.print_exc()
+        os._exit(0)
+
+    def _stop_server(self):
+        """Stop the running TCP server and release its port."""
+        if self.server is None:
+            return
+        try:
+            # Unblock the accept thread so the port is released before the
+            # new server binds (``stop()`` alone leaves it held).
+            self.server.server_socket.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.server.stop()
+        except Exception:
+            traceback.print_exc()
 
     # ------------------------------------------------------------------ routes
 
@@ -355,6 +393,32 @@ class ServerWebApp:
                 "server_config.html", fields=SERVER_PARAM_FIELDS, web_fields=WEB_FIELDS
             )
 
+        @app.get("/config")
+        def config():
+            """Startup-configuration page, reachable from the status page too."""
+            current = {}
+            web_port = self.web_port
+            if os.path.exists(SERVER_CONFIG_FILE):
+                try:
+                    with open(SERVER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    servers = data.get("servers", [])
+                    if servers:
+                        current = servers[0]
+                    web = data.get("web", {}) or {}
+                    web_port = int(web.get("port", web_port))
+                except Exception:
+                    pass
+            fields = [
+                (key, label, ftype, _config_display_value(key, current.get(key, default)), help)
+                for key, label, ftype, default, help in SERVER_PARAM_FIELDS
+            ]
+            web_fields = [
+                (key, label, ftype, web_port, help)
+                for key, label, ftype, default, help in WEB_FIELDS
+            ]
+            return render_template("server_config.html", fields=fields, web_fields=web_fields)
+
         @app.get("/api/status")
         def api_status():
             return jsonify(
@@ -363,6 +427,7 @@ class ServerWebApp:
                     "running": self.server is not None and self.server.running,
                     "server_info": self._server_info_payload() if self.server is not None else None,
                     "clients": self._client_list(),
+                    "pid": os.getpid(),
                 }
             )
 
@@ -376,6 +441,21 @@ class ServerWebApp:
             with open(SERVER_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
             self.web_port = web_port
+            if self.server is not None and web_port == self._bound_port:
+                # Same web port: restart the TCP server in place; the Flask
+                # app stays up, so there is no dead window.
+                self._stop_server()
+                try:
+                    self._start_server(params)
+                except Exception as e:
+                    traceback.print_exc()
+                    return jsonify({"ok": False, "error": f"failed to start TCP server: {e}"}), 500
+                return jsonify({"ok": True, "server_info": self._server_info_payload()})
+            if self.server is not None:
+                # Web port changed: the Flask app cannot rebind, so restart
+                # the whole process for the new port to take effect.
+                threading.Thread(target=self._restart, daemon=True).start()
+                return jsonify({"ok": True, "restarting": True})
             try:
                 self._start_server(params)
             except Exception as e:
